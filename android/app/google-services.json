@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "374567263613",
+    "project_id": "hydrate-smart-dc6b9",
+    "storage_bucket": "hydrate-smart-dc6b9.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:374567263613:android:1ec4360960cdc1e8294014",
+        "android_client_info": {
+          "package_name": "com.example.hydrate_"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAgULYOoTRDkCHuexFn8F350_KTiT718Ms"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
