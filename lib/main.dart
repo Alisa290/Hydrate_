@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 
 import 'firebase_options.dart';
@@ -16,8 +19,140 @@ Future<void> main() async {
   runApp(const MyApp());
 }
 
-class MyApp extends StatelessWidget {
+class MyApp extends StatefulWidget {
   const MyApp({super.key});
+
+  @override
+  State<MyApp> createState() => _MyAppState();
+}
+
+class _MyAppState extends State<MyApp>
+    with WidgetsBindingObserver {
+  // =====================================================
+  // DAILY BOTTLE CONNECTION CONTROL
+  // =====================================================
+  static const String databaseUrl =
+      'https://hydrate-smart-dc6b9-default-rtdb.asia-southeast1.firebasedatabase.app';
+
+  static const String bottleDeviceId = 'bottle_001';
+
+  late final FirebaseDatabase realtimeDatabase;
+
+  Timer? _dailyDisconnectTimer;
+  bool _isCheckingDailyDisconnect = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    WidgetsBinding.instance.addObserver(this);
+
+    realtimeDatabase = FirebaseDatabase.instanceFor(
+      app: Firebase.app(),
+      databaseURL: databaseUrl,
+    );
+
+    // ตรวจทันทีตอนเปิดแอป
+    _checkDailyBottleDisconnect();
+
+    // ตรวจเวลาเป็นระยะตลอดเวลาที่แอปกำลังทำงาน
+    _dailyDisconnectTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _checkDailyBottleDisconnect(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _dailyDisconnectTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(
+    AppLifecycleState state,
+  ) {
+    if (state == AppLifecycleState.resumed) {
+      // ถ้าผู้ใช้กลับเข้าแอปหลัง 21:00
+      // ให้ตรวจสถานะขวดทันที
+      _checkDailyBottleDisconnect();
+    }
+  }
+
+  bool _isAfterDailyCutoff([
+    DateTime? now,
+  ]) {
+    final current = now ?? DateTime.now();
+
+    return current.hour >= 21;
+  }
+
+  // =====================================================
+  // AUTO DISCONNECT BOTTLE AT / AFTER 21:00
+  //
+  // ลบเฉพาะ:
+  // devices/bottle_001/active_user_id
+  //
+  // ไม่ลบบัญชีผู้ใช้
+  // ไม่ลบ profiles
+  // ไม่ลบ water_history
+  // ไม่ลบ notifications
+  // ไม่ลบ drink_settings
+  //
+  // เมื่อ active_user_id ถูกลบ
+  // วันถัดไปผู้ใช้ต้องกดเชื่อมต่อขวดใหม่เอง
+  // =====================================================
+  Future<void> _checkDailyBottleDisconnect() async {
+    if (_isCheckingDailyDisconnect) {
+      return;
+    }
+
+    if (!_isAfterDailyCutoff()) {
+      return;
+    }
+
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) {
+      return;
+    }
+
+    _isCheckingDailyDisconnect = true;
+
+    try {
+      final activeUserRef = realtimeDatabase.ref(
+        'devices/$bottleDeviceId/active_user_id',
+      );
+
+      final snapshot = await activeUserRef.get();
+
+      final String? activeUid =
+          snapshot.exists && snapshot.value != null
+              ? snapshot.value.toString().trim()
+              : null;
+
+      // ป้องกันไม่ให้บัญชีนี้ไปตัดขวดของบัญชีอื่น
+      // จะลบเฉพาะเมื่อขวดกำลังเชื่อมกับ UID
+      // ของผู้ใช้ที่ล็อกอินอยู่เท่านั้น
+      if (activeUid == user.uid) {
+        await activeUserRef.remove();
+
+        debugPrint(
+          'Bottle disconnected automatically at/after 21:00',
+        );
+        debugPrint(
+          'Removed only devices/$bottleDeviceId/active_user_id',
+        );
+      }
+    } catch (error) {
+      debugPrint(
+        'Daily bottle disconnect error: $error',
+      );
+    } finally {
+      _isCheckingDailyDisconnect = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
@@ -20,23 +21,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
   static const Color softBlue = Color(0xFFA8D2FF);
   static const Color bg = Color(0xFFEAF8FF);
 
-  // ============================================================
-  // FIREBASE REALTIME DATABASE
-  // ============================================================
-
   static const String databaseUrl =
       'https://hydrate-smart-dc6b9-default-rtdb.asia-southeast1.firebasedatabase.app';
-
-  // ============================================================
-  // UID เดียวกับหน้า HOME และ ESP32
-  // ============================================================
-
-  static const String bottleUserId =
-      'jE9aQG2EgtMRFLb8lKaqRpIf1QH3';
-
-  // ============================================================
-  // DEVICE ID
-  // ============================================================
 
   static const String bottleDeviceId = 'bottle_001';
 
@@ -49,31 +35,47 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
   bool isWeekly = false;
   bool isLoading = true;
-
   bool hasBottleData = false;
 
+  // กันโหลด daily ซ้อนกันหลายรอบจนแอปค้าง
+  bool _isLoadingDaily = false;
+
+  // กันโหลด weekly ซ้อนกัน
+  bool _isLoadingWeekly = false;
+
   DateTime selectedDay = _dateOnly(DateTime.now());
-  DateTime selectedWeekStart = _startOfWeekSunday(DateTime.now());
+
+  DateTime selectedWeekStart = _startOfWeekSunday(
+    DateTime.now(),
+  );
 
   int dailyGoalMl = 1400;
+
+  // เป้าหมายรวมทั้งสัปดาห์ = เป้าหมายรายวัน x 7
+  int get weeklyGoalMl => dailyGoalMl * 7;
 
   int selectedDrankMl = 0;
   int selectedPercent = 0;
 
   int todayDrankMl = 0;
 
+  // ค่าจากขวด
+  // ใช้แสดงสถานะขวดเท่านั้น
   int bottleRemainingMl = 0;
   int bottleLevelPercent = 0;
 
-  List<int> dailyBars = List<int>.filled(8, 0);
-  List<int> weeklyBars = List<int>.filled(7, 0);
+  List<int> dailyBars = List<int>.filled(
+    7,
+    0,
+  );
+
+  List<int> weeklyBars = List<int>.filled(
+    7,
+    0,
+  );
 
   StreamSubscription<DatabaseEvent>? bottleSubscription;
   StreamSubscription<DatabaseEvent>? historySubscription;
-
-  // ============================================================
-  // INIT
-  // ============================================================
 
   @override
   void initState() {
@@ -88,16 +90,31 @@ class _StatisticsPageState extends State<StatisticsPage> {
     super.dispose();
   }
 
-  // ============================================================
-  // LOAD PROFILE + START
-  // ============================================================
-
   Future<void> _loadProfileAndData() async {
     try {
+      final user = FirebaseAuth.instance.currentUser;
+
+      if (user == null) {
+        debugPrint(
+          'STATISTICS PAGE: no logged-in user',
+        );
+
+        if (mounted) {
+          setState(() {
+            isLoading = false;
+            hasBottleData = false;
+          });
+        }
+
+        return;
+      }
+
+      final uid = user.uid;
+
       debugPrint('');
       debugPrint('================================');
       debugPrint('STATISTICS PAGE START');
-      debugPrint('UID = $bottleUserId');
+      debugPrint('LOGGED-IN UID = $uid');
       debugPrint('DATABASE URL = $databaseUrl');
       debugPrint('DEVICE ID = $bottleDeviceId');
       debugPrint('================================');
@@ -105,10 +122,12 @@ class _StatisticsPageState extends State<StatisticsPage> {
       try {
         final profileDoc = await FirebaseFirestore.instance
             .collection('profiles')
-            .doc(bottleUserId)
+            .doc(uid)
             .get()
             .timeout(
-              const Duration(seconds: 8),
+              const Duration(
+                seconds: 8,
+              ),
             );
 
         if (profileDoc.exists) {
@@ -122,7 +141,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
           if (manualGoal > 0) {
             dailyGoalMl = manualGoal;
           } else {
-            final calculatedGoal = _calculateGoalFromProfile(data);
+            final calculatedGoal = _calculateGoalFromProfile(
+              data,
+            );
 
             if (calculatedGoal > 0) {
               dailyGoalMl = calculatedGoal;
@@ -130,19 +151,29 @@ class _StatisticsPageState extends State<StatisticsPage> {
           }
         }
       } on TimeoutException {
-        debugPrint('Profile loading timeout');
+        debugPrint(
+          'Profile loading timeout',
+        );
       } on FirebaseException catch (e) {
-        debugPrint('Firestore profile error: ${e.code}');
-        debugPrint('Firestore profile message: ${e.message}');
+        debugPrint(
+          'Firestore profile error: ${e.code}',
+        );
+        debugPrint(
+          'Firestore profile message: ${e.message}',
+        );
       } catch (e) {
-        debugPrint('Profile error: $e');
+        debugPrint(
+          'Profile error: $e',
+        );
       }
 
       if (dailyGoalMl <= 0) {
         dailyGoalMl = 1400;
       }
 
-      debugPrint('FINAL DAILY GOAL = $dailyGoalMl ml');
+      debugPrint(
+        'FINAL DAILY GOAL = $dailyGoalMl ml',
+      );
 
       if (mounted) {
         setState(() {
@@ -155,8 +186,12 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
       await _loadSelectedData();
     } catch (e, stack) {
-      debugPrint('Load profile/data error: $e');
-      debugPrint('$stack');
+      debugPrint(
+        'Load profile/data error: $e',
+      );
+      debugPrint(
+        '$stack',
+      );
 
       if (mounted) {
         setState(() {
@@ -167,27 +202,46 @@ class _StatisticsPageState extends State<StatisticsPage> {
   }
 
   // ============================================================
-  // LISTEN DEVICE
+  // LISTEN BOTTLE
   //
-  // current_volume_ml = ปริมาณน้ำที่เหลือ
-  // bottle_level_percent = % น้ำที่เหลือ
+  // สำคัญ:
+  // current_volume_ml = น้ำที่อยู่ในขวด
+  // bottle_level_percent = % น้ำในขวด
   //
-  // ดื่มแล้ว = goal - น้ำที่เหลือ
-  // % ดื่มแล้ว = 100 - % น้ำที่เหลือ
+  // ห้ามนำไปคำนวณว่า "ดื่มแล้ววันนี้"
   // ============================================================
 
   void _listenBottle() {
     bottleSubscription?.cancel();
 
-    final path =
-        'users/$bottleUserId/devices/$bottleDeviceId';
+    final user = FirebaseAuth.instance.currentUser;
 
-    final ref = _database.ref(path);
+    if (user == null) {
+      if (mounted) {
+        setState(() {
+          hasBottleData = false;
+          bottleRemainingMl = 0;
+          bottleLevelPercent = 0;
+        });
+      }
+
+      return;
+    }
+
+    final uid = user.uid;
+
+    final path =
+        'users/$uid/devices/$bottleDeviceId';
+
+    final ref = _database.ref(
+      path,
+    );
 
     debugPrint('');
     debugPrint('================================');
     debugPrint('STATISTICS - LISTENING DEVICE');
-    debugPrint('Path: $path');
+    debugPrint('UID = $uid');
+    debugPrint('Path = $path');
     debugPrint('================================');
 
     bottleSubscription = ref.onValue.listen(
@@ -196,11 +250,18 @@ class _StatisticsPageState extends State<StatisticsPage> {
           final value = event.snapshot.value;
 
           if (value is! Map) {
-            debugPrint('Bottle data is not Map');
+            if (!mounted) return;
+
+            setState(() {
+              hasBottleData = false;
+            });
+
             return;
           }
 
-          final data = Map<dynamic, dynamic>.from(value);
+          final data = Map<dynamic, dynamic>.from(
+            value,
+          );
 
           final newBottleRemainingMl = _toInt(
             data['current_volume_ml'],
@@ -212,16 +273,6 @@ class _StatisticsPageState extends State<StatisticsPage> {
             fallback: 0,
           ).clamp(0, 100).toInt();
 
-          final drankToday =
-              (dailyGoalMl - newBottleRemainingMl)
-                  .clamp(0, dailyGoalMl)
-                  .toInt();
-
-          final drankPercent =
-              (100 - newBottleLevelPercent)
-                  .clamp(0, 100)
-                  .toInt();
-
           debugPrint('');
           debugPrint('========== BOTTLE UPDATE ==========');
           debugPrint(
@@ -231,35 +282,23 @@ class _StatisticsPageState extends State<StatisticsPage> {
             'Bottle level = $newBottleLevelPercent%',
           );
           debugPrint(
-            'Home-style drank = $drankToday ml',
+            '===================================',
           );
-          debugPrint(
-            'Home-style percent = $drankPercent%',
-          );
-          debugPrint('===================================');
 
           if (!mounted) return;
 
           setState(() {
             hasBottleData = true;
-
             bottleRemainingMl = newBottleRemainingMl;
             bottleLevelPercent = newBottleLevelPercent;
-
-            todayDrankMl = drankToday;
-
-            if (!isWeekly &&
-                _isSameDay(
-                  selectedDay,
-                  DateTime.now(),
-                )) {
-              selectedDrankMl = drankToday;
-              selectedPercent = drankPercent;
-            }
           });
         } catch (e, stack) {
-          debugPrint('Bottle listener error: $e');
-          debugPrint('$stack');
+          debugPrint(
+            'Bottle listener error: $e',
+          );
+          debugPrint(
+            '$stack',
+          );
         }
       },
       onError: (error) {
@@ -271,40 +310,72 @@ class _StatisticsPageState extends State<StatisticsPage> {
   }
 
   // ============================================================
-  // LISTEN WATER HISTORY TODAY
+  // LISTEN TODAY HISTORY
+  //
+  // มีตัวกันโหลดซ้ำแล้ว
   // ============================================================
 
   void _listenTodayHistory() {
     historySubscription?.cancel();
 
-    final todayKey = _dateKey(DateTime.now());
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) {
+      debugPrint(
+        'STATISTICS _listenTodayHistory: no logged-in user',
+      );
+      return;
+    }
+
+    final uid = user.uid;
+
+    final todayKey = _dateKey(
+      DateTime.now(),
+    );
 
     final path =
-        'users/$bottleUserId/water_history/$todayKey';
+        'users/$uid/water_history/$todayKey';
 
-    final ref = _database.ref(path);
+    final ref = _database.ref(
+      path,
+    );
+
+    debugPrint('');
+    debugPrint('STATISTICS - LISTENING HISTORY');
+    debugPrint('UID = $uid');
+    debugPrint('Path = $path');
 
     historySubscription = ref.onValue.listen(
-      (event) async {
+      (event) {
         try {
+          if (!mounted) return;
+
           if (!isWeekly &&
               _isSameDay(
                 selectedDay,
                 DateTime.now(),
               )) {
-            await _loadDailyData();
+            _loadDailyData();
           }
 
           if (isWeekly) {
             final weekEnd = selectedWeekStart.add(
-              const Duration(days: 6),
+              const Duration(
+                days: 6,
+              ),
             );
 
-            final today = _dateOnly(DateTime.now());
+            final today = _dateOnly(
+              DateTime.now(),
+            );
 
-            if (!today.isBefore(selectedWeekStart) &&
-                !today.isAfter(weekEnd)) {
-              await _loadWeeklyData();
+            if (!today.isBefore(
+                  selectedWeekStart,
+                ) &&
+                !today.isAfter(
+                  weekEnd,
+                )) {
+              _loadWeeklyData();
             }
           }
         } catch (e) {
@@ -321,10 +392,6 @@ class _StatisticsPageState extends State<StatisticsPage> {
     );
   }
 
-  // ============================================================
-  // LOAD SELECTED DATA
-  // ============================================================
-
   Future<void> _loadSelectedData() async {
     try {
       if (isWeekly) {
@@ -336,22 +403,25 @@ class _StatisticsPageState extends State<StatisticsPage> {
       debugPrint(
         'Load selected data error: $e',
       );
-      debugPrint('$stack');
+      debugPrint(
+        '$stack',
+      );
     }
   }
-
-  // ============================================================
-  // DAILY
+    // ============================================================
+  // LOAD DAILY DATA
   //
-  // วันนี้:
-  // ภาพรวม = ใช้ค่าจากขวดแบบเดียวกับ Home
-  // กราฟ = ใช้ history
-  //
-  // วันย้อนหลัง:
-  // ใช้ history ทั้งหมด
+  // กันโหลดซ้อนด้วย _isLoadingDaily
+  // และใช้ water_history เป็นแหล่งข้อมูล "ดื่มแล้ว"
   // ============================================================
 
   Future<void> _loadDailyData() async {
+    if (_isLoadingDaily) {
+      return;
+    }
+
+    _isLoadingDaily = true;
+
     try {
       final result = await _calculateDayHistory(
         selectedDay,
@@ -362,71 +432,77 @@ class _StatisticsPageState extends State<StatisticsPage> {
         DateTime.now(),
       );
 
-      int overviewDrank;
-      int overviewPercent;
+      final overviewDrank = result.totalDrank
+          .clamp(
+            0,
+            dailyGoalMl,
+          )
+          .toInt();
 
-      if (isToday && hasBottleData) {
-        overviewDrank =
-            (dailyGoalMl - bottleRemainingMl)
-                .clamp(0, dailyGoalMl)
-                .toInt();
-
-        overviewPercent =
-            (100 - bottleLevelPercent)
-                .clamp(0, 100)
-                .toInt();
-      } else {
-        overviewDrank = result.totalDrank;
-
-        overviewPercent = _percent(
-          overviewDrank,
-          dailyGoalMl,
-        );
-      }
+      final overviewPercent = _percent(
+        overviewDrank,
+        dailyGoalMl,
+      );
 
       if (!mounted) return;
 
       setState(() {
-        dailyBars = List<int>.from(result.bars);
+        dailyBars = List<int>.from(
+          result.bars,
+        );
 
-        selectedDrankMl = overviewDrank;
-        selectedPercent = overviewPercent;
+        selectedDrankMl =
+            overviewDrank;
+
+        selectedPercent =
+            overviewPercent;
 
         if (isToday) {
-          todayDrankMl = overviewDrank;
+          todayDrankMl =
+              overviewDrank;
         }
       });
 
       debugPrint('');
-      debugPrint('================ DAILY =================');
-      debugPrint('Date = ${_dateKey(selectedDay)}');
-      debugPrint('Goal = $dailyGoalMl ml');
-      debugPrint('Has bottle data = $hasBottleData');
       debugPrint(
-        'Bottle remaining = $bottleRemainingMl ml',
+        '================ DAILY =================',
       );
       debugPrint(
-        'Bottle level = $bottleLevelPercent%',
+        'Date = ${_dateKey(selectedDay)}',
       );
       debugPrint(
-        'History latest = ${result.latestVolumeMl} ml',
+        'Goal = $dailyGoalMl ml',
       );
       debugPrint(
-        'History total drank = ${result.totalDrank} ml',
+        'History latest volume = '
+        '${result.latestVolumeMl} ml',
       );
       debugPrint(
-        'Overview drank = $overviewDrank ml',
+        'History total drank = '
+        '${result.totalDrank} ml',
       );
       debugPrint(
-        'Overview percent = $overviewPercent%',
+        'Overview drank = '
+        '$overviewDrank ml',
       );
-      debugPrint('Bars = $dailyBars');
-      debugPrint('========================================');
+      debugPrint(
+        'Overview percent = '
+        '$overviewPercent%',
+      );
+      debugPrint(
+        'Bars = $dailyBars',
+      );
+      debugPrint(
+        '========================================',
+      );
     } catch (e, stack) {
       debugPrint(
         'Load daily history error: $e',
       );
-      debugPrint('$stack');
+
+      debugPrint(
+        '$stack',
+      );
 
       if (!mounted) return;
 
@@ -436,66 +512,98 @@ class _StatisticsPageState extends State<StatisticsPage> {
       );
 
       setState(() {
-        dailyBars = List<int>.filled(8, 0);
+        dailyBars = List<int>.filled(
+          7,
+          0,
+        );
 
-        if (isToday && hasBottleData) {
-          selectedDrankMl =
-              (dailyGoalMl - bottleRemainingMl)
-                  .clamp(0, dailyGoalMl)
-                  .toInt();
+        selectedDrankMl = 0;
+        selectedPercent = 0;
 
-          selectedPercent =
-              (100 - bottleLevelPercent)
-                  .clamp(0, 100)
-                  .toInt();
-        } else {
-          selectedDrankMl = 0;
-          selectedPercent = 0;
+        if (isToday) {
+          todayDrankMl = 0;
         }
       });
+    } finally {
+      _isLoadingDaily = false;
     }
   }
 
   // ============================================================
-  // CALCULATE ONE DAY
+  // CALCULATE DAY HISTORY
   //
-  // volume_ml = ปริมาณน้ำที่เหลือในขวด
+  // แนวคิด:
   //
-  // เช่น
-  // 07:10 = 1400 ml
-  // 07:30 = 1300 ml
+  // 1060 -> 1020 = ดื่ม 40 ml
   //
-  // ดื่ม = 1400 - 1300 = 100 ml
-  //
-  // ถ้าน้ำเพิ่ม เช่น 700 -> 1500
-  // ถือว่าเติมน้ำ ไม่นับเป็นการดื่ม
+  // 700 -> 1500 = เติมน้ำ
+  // ไม่นับเป็นการดื่ม
   // ============================================================
 
   Future<_DayHistoryResult> _calculateDayHistory(
     DateTime day,
   ) async {
-    final bars = List<int>.filled(8, 0);
+    final bars = List<int>.filled(
+      7,
+      0,
+    );
 
-    final dateKey = _dateKey(day);
+    final user =
+        FirebaseAuth.instance.currentUser;
+
+    if (user == null) {
+      return _DayHistoryResult(
+        bars: bars,
+        totalDrank: 0,
+        latestVolumeMl: 0,
+        hasRecords: false,
+      );
+    }
+
+    final uid = user.uid;
+
+    final dateKey =
+        _dateKey(
+      day,
+    );
 
     final path =
-        'users/$bottleUserId/water_history/$dateKey';
+        'users/$uid/water_history/$dateKey';
 
     debugPrint('');
-    debugPrint('--------------------------------');
-    debugPrint('LOAD DAY HISTORY');
-    debugPrint('DATE = $dateKey');
-    debugPrint('Path = $path');
-    debugPrint('--------------------------------');
+    debugPrint(
+      '--------------------------------',
+    );
+    debugPrint(
+      'LOAD DAY HISTORY',
+    );
+    debugPrint(
+      'UID = $uid',
+    );
+    debugPrint(
+      'DATE = $dateKey',
+    );
+    debugPrint(
+      'Path = $path',
+    );
+    debugPrint(
+      '--------------------------------',
+    );
 
-    final DatabaseReference ref = _database.ref(path);
+    final ref =
+        _database.ref(
+      path,
+    );
 
     DataSnapshot snapshot;
 
     try {
-      snapshot = await ref.get();
+      snapshot =
+          await ref.get();
     } catch (e) {
-      debugPrint('RTDB GET ERROR = $e');
+      debugPrint(
+        'RTDB GET ERROR = $e',
+      );
 
       return _DayHistoryResult(
         bars: bars,
@@ -515,7 +623,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
       );
     }
 
-    final rawValue = snapshot.value;
+    final rawValue =
+        snapshot.value;
 
     if (rawValue is! Map) {
       return _DayHistoryResult(
@@ -531,7 +640,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
       rawValue,
     );
 
-    final List<_WaterHistoryRecord> records = [];
+    final List<_WaterHistoryRecord>
+        records = [];
 
     historyMap.forEach(
       (key, value) {
@@ -544,7 +654,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
           value,
         );
 
-        final volume = _toInt(
+        final volume =
+            _toInt(
           data['volume_ml'],
           fallback: -1,
         );
@@ -559,7 +670,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
           key.toString(),
         );
 
-        final timestamp = _toInt(
+        final timestamp =
+            _toInt(
           data['timestamp'],
           fallback: 0,
         );
@@ -577,7 +689,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
         }
 
         if (!_isSameDay(
-          recordTime!,
+          recordTime,
           day,
         )) {
           return;
@@ -585,10 +697,14 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
         records.add(
           _WaterHistoryRecord(
-            key: key.toString(),
-            time: recordTime!,
-            volumeMl: volume,
-            timestamp: timestamp,
+            key:
+                key.toString(),
+            time:
+                recordTime,
+            volumeMl:
+                volume,
+            timestamp:
+                timestamp,
           ),
         );
       },
@@ -604,7 +720,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
     }
 
     records.sort(
-      (a, b) => a.time.compareTo(b.time),
+      (a, b) =>
+          a.time.compareTo(
+        b.time,
+      ),
     );
 
     debugPrint('');
@@ -622,19 +741,29 @@ class _StatisticsPageState extends State<StatisticsPage> {
       );
     }
 
-    final now = DateTime.now();
+    final now =
+        DateTime.now();
 
-    final isToday = _isSameDay(day, now);
+    final isToday =
+        _isSameDay(
+      day,
+      now,
+    );
 
-    final List<_WaterHistoryRecord> validRecords = [];
+    final List<_WaterHistoryRecord>
+        validRecords = [];
 
     for (final record in records) {
       if (isToday &&
-          record.time.isAfter(now)) {
+          record.time.isAfter(
+            now,
+          )) {
         continue;
       }
 
-      validRecords.add(record);
+      validRecords.add(
+        record,
+      );
     }
 
     if (validRecords.isEmpty) {
@@ -648,11 +777,16 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
     int totalDrank = 0;
 
-    for (int i = 1;
-        i < validRecords.length;
-        i++) {
-      final previous = validRecords[i - 1];
-      final current = validRecords[i];
+    for (
+      int i = 1;
+      i < validRecords.length;
+      i++
+    ) {
+      final previous =
+          validRecords[i - 1];
+
+      final current =
+          validRecords[i];
 
       final difference =
           previous.volumeMl -
@@ -675,11 +809,16 @@ class _StatisticsPageState extends State<StatisticsPage> {
         continue;
       }
 
-      final drankAmount = difference;
+      final drankAmount =
+          difference;
 
-      totalDrank += drankAmount;
+      totalDrank +=
+          drankAmount;
 
-      final slot = _slotIndex(current.time);
+      final slot =
+          _slotIndex(
+        current.time,
+      );
 
       debugPrint(
         'ดื่ม $drankAmount ml '
@@ -693,7 +832,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
         continue;
       }
 
-      bars[slot] += drankAmount;
+      bars[slot] +=
+          drankAmount;
 
       debugPrint(
         'BAR ${_dailyLabels()[slot]} '
@@ -702,7 +842,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
       );
     }
 
-    final latest = validRecords.last;
+    final latest =
+        validRecords.last;
 
     final latestVolumeMl =
         latest.volumeMl;
@@ -712,34 +853,43 @@ class _StatisticsPageState extends State<StatisticsPage> {
       '================ RESULT ================',
     );
     debugPrint(
-      'น้ำเหลือล่าสุด = $latestVolumeMl ml',
+      'น้ำในขวดล่าสุด = '
+      '$latestVolumeMl ml',
     );
     debugPrint(
-      'ดื่มรวมทั้งวัน = $totalDrank ml',
+      'ดื่มรวมทั้งวัน = '
+      '$totalDrank ml',
     );
     debugPrint(
-      'DAILY BARS = $bars',
+      'DAILY BARS = '
+      '$bars',
     );
     debugPrint(
       '========================================',
     );
 
     return _DayHistoryResult(
-      bars: List<int>.from(bars),
-      totalDrank: totalDrank,
-      latestVolumeMl: latestVolumeMl,
-      hasRecords: true,
+      bars:
+          List<int>.from(
+        bars,
+      ),
+      totalDrank:
+          totalDrank,
+      latestVolumeMl:
+          latestVolumeMl,
+      hasRecords:
+          true,
     );
   }
-
-  // ============================================================
-  // TIMESTAMP
+    // ============================================================
+  // TIMESTAMP -> DATETIME
   // ============================================================
 
   DateTime? _dateTimeFromTimestamp(
     int timestamp,
   ) {
     try {
+      // กรณี timestamp เป็น milliseconds
       if (timestamp > 1000000000000) {
         return DateTime
             .fromMillisecondsSinceEpoch(
@@ -747,6 +897,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
         ).toLocal();
       }
 
+      // กรณี timestamp เป็น seconds
       return DateTime
           .fromMillisecondsSinceEpoch(
         timestamp * 1000,
@@ -756,12 +907,19 @@ class _StatisticsPageState extends State<StatisticsPage> {
       debugPrint(
         'Timestamp convert error: $e',
       );
+
       return null;
     }
   }
 
   // ============================================================
-  // TIME FROM KEY
+  // PARSE TIME FROM HISTORY KEY
+  //
+  // รองรับ key เช่น
+  // 15-30
+  // 15-30-10
+  // 15:30
+  // 15:30:10
   // ============================================================
 
   DateTime? _timeFromHistoryKey(
@@ -769,10 +927,14 @@ class _StatisticsPageState extends State<StatisticsPage> {
     String key,
   ) {
     try {
-      String cleanKey = key.trim();
+      String cleanKey =
+          key.trim();
 
       cleanKey =
-          cleanKey.replaceAll(':', '-');
+          cleanKey.replaceAll(
+        ':',
+        '-',
+      );
 
       final parts =
           cleanKey.split('-');
@@ -782,16 +944,23 @@ class _StatisticsPageState extends State<StatisticsPage> {
       }
 
       final hour =
-          int.tryParse(parts[0]);
+          int.tryParse(
+        parts[0],
+      );
 
       final minute =
-          int.tryParse(parts[1]);
+          int.tryParse(
+        parts[1],
+      );
 
       int second = 0;
 
       if (parts.length >= 3) {
         second =
-            int.tryParse(parts[2]) ?? 0;
+            int.tryParse(
+              parts[2],
+            ) ??
+            0;
       }
 
       if (hour == null ||
@@ -826,75 +995,195 @@ class _StatisticsPageState extends State<StatisticsPage> {
   }
 
   // ============================================================
-  // WEEKLY
+  // LOAD WEEKLY DATA
+  //
+  // กันโหลด weekly ซ้อนกันด้วย _isLoadingWeekly
   // ============================================================
 
   Future<void> _loadWeeklyData() async {
-    final newWeeklyBars =
-        List<int>.filled(7, 0);
-
-    int sum = 0;
-    int dayCount = 0;
-
-    final today =
-        _dateOnly(DateTime.now());
-
-    for (int i = 0; i < 7; i++) {
-      final day =
-          selectedWeekStart.add(
-        Duration(days: i),
-      );
-
-      if (day.isAfter(today)) {
-        newWeeklyBars[i] = 0;
-        continue;
-      }
-
-      try {
-        final result =
-            await _calculateDayHistory(
-          day,
-        );
-
-        newWeeklyBars[i] =
-            result.totalDrank;
-
-        if (result.hasData) {
-          sum += result.totalDrank;
-          dayCount++;
-        }
-      } catch (e) {
-        debugPrint(
-          'Weekly error ${_dateKey(day)}: $e',
-        );
-
-        newWeeklyBars[i] = 0;
-      }
+    if (_isLoadingWeekly) {
+      return;
     }
 
-    final average =
-        dayCount > 0
-            ? (sum / dayCount).round()
-            : 0;
+    _isLoadingWeekly = true;
 
-    final percent = _percent(
-      average,
-      dailyGoalMl,
-    );
+    try {
+      final newWeeklyBars =
+          List<int>.filled(
+        7,
+        0,
+      );
 
-    if (!mounted) return;
+      int sum = 0;
+      int dayCount = 0;
 
-    setState(() {
-      weeklyBars =
-          List<int>.from(newWeeklyBars);
+      final today =
+          _dateOnly(
+        DateTime.now(),
+      );
 
-      selectedDrankMl = average;
-      selectedPercent = percent;
-    });
+      for (
+        int i = 0;
+        i < 7;
+        i++
+      ) {
+        final day =
+            selectedWeekStart.add(
+          Duration(
+            days: i,
+          ),
+        );
+
+        // วันในอนาคต
+        if (day.isAfter(
+          today,
+        )) {
+          newWeeklyBars[i] = 0;
+          continue;
+        }
+
+        try {
+          final result =
+              await _calculateDayHistory(
+            day,
+          );
+
+          final drank =
+              result.totalDrank
+                  .clamp(
+                    0,
+                    dailyGoalMl,
+                  )
+                  .toInt();
+
+          newWeeklyBars[i] =
+              drank;
+
+          if (result.hasData) {
+            sum += drank;
+            dayCount++;
+          }
+        } catch (e) {
+          debugPrint(
+            'Weekly day error '
+            '${_dateKey(day)}: $e',
+          );
+
+          newWeeklyBars[i] = 0;
+        }
+      }
+
+      // ========================================================
+      // ค่าเฉลี่ยต่อวัน
+      // ========================================================
+
+      final average =
+          dayCount > 0
+              ? (sum / dayCount)
+                  .round()
+              : 0;
+
+      // ========================================================
+      // เป้าหมายรวมรายสัปดาห์
+      // dailyGoalMl x 7
+      // ========================================================
+
+      final weekGoal =
+          weeklyGoalMl;
+
+      // ========================================================
+      // เปอร์เซ็นต์ของน้ำที่ดื่มรวมทั้งสัปดาห์
+      // เทียบกับเป้าหมายรวมทั้งสัปดาห์
+      // ========================================================
+
+      final percent =
+          _percent(
+        sum,
+        weekGoal,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        weeklyBars =
+            List<int>.from(
+          newWeeklyBars,
+        );
+
+        // ช่องแรกยังแสดงค่าเฉลี่ยต่อวัน
+        selectedDrankMl =
+            average;
+
+        // เปอร์เซ็นต์ใช้ยอดรวมทั้งสัปดาห์ / เป้าหมายรวมทั้งสัปดาห์
+        selectedPercent =
+            percent;
+      });
+
+      debugPrint('');
+      debugPrint(
+        '================ WEEKLY ================',
+      );
+
+      debugPrint(
+        'Weekly bars = $weeklyBars',
+      );
+
+      debugPrint(
+        'Average drank = '
+        '$average ml/day',
+      );
+
+      debugPrint(
+        'Daily goal = '
+        '$dailyGoalMl ml',
+      );
+
+      debugPrint(
+        'Weekly goal = '
+        '$weeklyGoalMl ml',
+      );
+
+      debugPrint(
+        'Weekly total drank = '
+        '$sum ml',
+      );
+
+      debugPrint(
+        'Average percent = '
+        '$percent%',
+      );
+
+      debugPrint(
+        '========================================',
+      );
+    } catch (e, stack) {
+      debugPrint(
+        'Load weekly error: $e',
+      );
+
+      debugPrint(
+        '$stack',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        weeklyBars =
+            List<int>.filled(
+          7,
+          0,
+        );
+
+        selectedDrankMl = 0;
+        selectedPercent = 0;
+      });
+    } finally {
+      _isLoadingWeekly = false;
+    }
   }
 
   // ============================================================
-  // CALCULATE GOAL
+  // CALCULATE DAILY GOAL FROM PROFILE
   // ============================================================
 
   int _calculateGoalFromProfile(
@@ -903,7 +1192,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
     final gender =
         '${data['gender'] ?? ''}';
 
-    final heightCm = _toInt(
+    final heightCm =
+        _toInt(
       data['height_cm'],
       fallback: 160,
     );
@@ -915,24 +1205,31 @@ class _StatisticsPageState extends State<StatisticsPage> {
       return 1400;
     }
 
+    // cm -> inch
     final heightInch =
         heightCm / 2.54;
 
     final isFemale =
-        gender.contains('หญิง');
+        gender.contains(
+      'หญิง',
+    );
 
     double ibw;
 
     if (isFemale) {
       ibw =
           45.5 +
-          (2.3 *
-              (heightInch - 60));
+          (
+            2.3 *
+            (heightInch - 60)
+          );
     } else {
       ibw =
           50 +
-          (2.3 *
-              (heightInch - 60));
+          (
+            2.3 *
+            (heightInch - 60)
+          );
     }
 
     if (ibw <= 0) {
@@ -944,25 +1241,35 @@ class _StatisticsPageState extends State<StatisticsPage> {
     if (kidneyStage.contains('1') ||
         kidneyStage.contains('2')) {
       mlPerKg = 30;
-    } else if (kidneyStage.contains('3')) {
+    } else if (
+        kidneyStage.contains('3')) {
       mlPerKg = 25;
-    } else if (kidneyStage.contains('4')) {
+    } else if (
+        kidneyStage.contains('4')) {
       mlPerKg = 20;
-    } else if (kidneyStage.contains('5')) {
+    } else if (
+        kidneyStage.contains('5')) {
       mlPerKg = 15;
     }
 
     final rawGoal =
         ibw * mlPerKg;
 
-    return _roundToHundred(rawGoal);
+    return _roundToHundred(
+      rawGoal,
+    );
   }
+
+  // ============================================================
+  // ROUND TO HUNDRED
+  // ============================================================
 
   int _roundToHundred(
     double value,
   ) {
     final base =
-        (value ~/ 100) * 100;
+        (value ~/ 100) *
+        100;
 
     final remainder =
         value - base;
@@ -973,22 +1280,28 @@ class _StatisticsPageState extends State<StatisticsPage> {
   }
 
   // ============================================================
-  // PREVIOUS
+  // GO PREVIOUS
   // ============================================================
 
   void _goPrevious() {
     if (isWeekly) {
       setState(() {
         selectedWeekStart =
-            selectedWeekStart.subtract(
-          const Duration(days: 7),
+            selectedWeekStart
+                .subtract(
+          const Duration(
+            days: 7,
+          ),
         );
       });
     } else {
       setState(() {
         selectedDay =
-            selectedDay.subtract(
-          const Duration(days: 1),
+            selectedDay
+                .subtract(
+          const Duration(
+            days: 1,
+          ),
         );
       });
     }
@@ -1004,9 +1317,12 @@ class _StatisticsPageState extends State<StatisticsPage> {
     final picked =
         await showDatePicker(
       context: context,
-      initialDate: selectedDay,
-      firstDate: DateTime(2024),
-      lastDate: DateTime.now(),
+      initialDate:
+          selectedDay,
+      firstDate:
+          DateTime(2024),
+      lastDate:
+          DateTime.now(),
     );
 
     if (picked == null) {
@@ -1015,7 +1331,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
     setState(() {
       selectedDay =
-          _dateOnly(picked);
+          _dateOnly(
+        picked,
+      );
     });
 
     await _loadSelectedData();
@@ -1029,7 +1347,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
     DateTime tempWeek =
         selectedWeekStart;
 
-    final weeks = List.generate(
+    final weeks =
+        List.generate(
       12,
       (index) =>
           _startOfWeekSunday(
@@ -1054,7 +1373,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
               shape:
                   RoundedRectangleBorder(
                 borderRadius:
-                    BorderRadius.circular(18),
+                    BorderRadius.circular(
+                  18,
+                ),
               ),
               child: Padding(
                 padding:
@@ -1075,10 +1396,13 @@ class _StatisticsPageState extends State<StatisticsPage> {
                           color: blue,
                           size: 28,
                         ),
-                        SizedBox(width: 8),
+                        SizedBox(
+                          width: 8,
+                        ),
                         Text(
                           'เลือกช่วงสัปดาห์',
-                          style: TextStyle(
+                          style:
+                              TextStyle(
                             fontSize: 22,
                             fontWeight:
                                 FontWeight.bold,
@@ -1087,14 +1411,18 @@ class _StatisticsPageState extends State<StatisticsPage> {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 12),
+
+                    const SizedBox(
+                      height: 12,
+                    ),
+
                     SizedBox(
                       height: 300,
-                      child: ListView.builder(
+                      child:
+                          ListView.builder(
                         itemCount:
                             weeks.length,
-                        itemBuilder:
-                            (
+                        itemBuilder: (
                           context,
                           index,
                         ) {
@@ -1109,8 +1437,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
                           return ListTile(
                             dense: true,
+
                             contentPadding:
                                 EdgeInsets.zero,
+
                             title: Text(
                               _thaiWeekRange(
                                 week,
@@ -1121,11 +1451,15 @@ class _StatisticsPageState extends State<StatisticsPage> {
                                     FontWeight.bold,
                               ),
                             ),
+
                             trailing:
                                 Radio<DateTime>(
-                              value: week,
+                              value:
+                                  week,
+
                               groupValue:
                                   tempWeek,
+
                               onChanged:
                                   (value) {
                                 if (value ==
@@ -1141,12 +1475,15 @@ class _StatisticsPageState extends State<StatisticsPage> {
                                 );
                               },
                             ),
+
                             selected:
                                 isSelected,
+
                             selectedTileColor:
                                 const Color(
                               0xFFD7ECFF,
                             ),
+
                             shape:
                                 RoundedRectangleBorder(
                               borderRadius:
@@ -1154,6 +1491,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                                 8,
                               ),
                             ),
+
                             onTap: () {
                               setModalState(
                                 () {
@@ -1166,6 +1504,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
                         },
                       ),
                     ),
+
                     Row(
                       children: [
                         Expanded(
@@ -1182,9 +1521,11 @@ class _StatisticsPageState extends State<StatisticsPage> {
                             ),
                           ),
                         ),
+
                         const SizedBox(
                           width: 10,
                         ),
+
                         Expanded(
                           child:
                               ElevatedButton(
@@ -1225,13 +1566,13 @@ class _StatisticsPageState extends State<StatisticsPage> {
     }
 
     setState(() {
-      selectedWeekStart = picked;
+      selectedWeekStart =
+          picked;
     });
 
     await _loadSelectedData();
   }
-
-  // ============================================================
+    // ============================================================
   // BUILD
   // ============================================================
 
@@ -1244,7 +1585,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
     final scale =
         (size.width / 390)
-            .clamp(0.82, 1.0)
+            .clamp(
+              0.82,
+              1.0,
+            )
             .toDouble();
 
     final horizontalPadding =
@@ -1252,8 +1596,12 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
     final chartValues =
         isWeekly
-            ? List<int>.from(weeklyBars)
-            : List<int>.from(dailyBars);
+            ? List<int>.from(
+                weeklyBars,
+              )
+            : List<int>.from(
+                dailyBars,
+              );
 
     final chartLabels =
         isWeekly
@@ -1278,16 +1626,35 @@ class _StatisticsPageState extends State<StatisticsPage> {
     final percent =
         selectedPercent;
 
+    // เป้าหมายที่ใช้แสดง:
+    // รายวัน = dailyGoalMl
+    // รายสัปดาห์ = dailyGoalMl x 7
+    final displayGoal =
+        isWeekly
+            ? weeklyGoalMl
+            : dailyGoalMl;
+
+    // ยอดรวมรายสัปดาห์จากแท่งทั้ง 7 วัน
+    final weeklyTotalDrank =
+        weeklyBars.fold<int>(
+      0,
+      (sum, value) => sum + value,
+    );
+
     final remaining =
-        (dailyGoalMl - firstValue)
+        (displayGoal -
+                (isWeekly
+                    ? weeklyTotalDrank
+                    : firstValue))
             .clamp(
               0,
-              dailyGoalMl,
+              displayGoal,
             )
             .toInt();
 
     return Scaffold(
       backgroundColor: bg,
+
       body: SafeArea(
         child: isLoading
             ? const Center(
@@ -1306,28 +1673,45 @@ class _StatisticsPageState extends State<StatisticsPage> {
                       horizontalPadding,
                       135 * scale,
                     ),
+
                     child: Column(
                       crossAxisAlignment:
                           CrossAxisAlignment.start,
+
                       children: [
                         Text(
                           'สถิติการดื่มน้ำ',
-                          style: TextStyle(
+
+                          style:
+                              TextStyle(
                             fontSize:
                                 42 * scale,
+
                             fontWeight:
                                 FontWeight.w900,
-                            color: blue,
-                            height: 1.05,
+
+                            color:
+                                blue,
+
+                            height:
+                                1.05,
                           ),
                         ),
+
                         SizedBox(
-                          height: 20 * scale,
+                          height:
+                              20 * scale,
                         ),
+
                         _ModeSwitch(
-                          isWeekly: isWeekly,
-                          scale: scale,
-                          onChanged: (value) {
+                          isWeekly:
+                              isWeekly,
+
+                          scale:
+                              scale,
+
+                          onChanged:
+                              (value) {
                             if (value ==
                                 isWeekly) {
                               return;
@@ -1341,69 +1725,105 @@ class _StatisticsPageState extends State<StatisticsPage> {
                             _loadSelectedData();
                           },
                         ),
+
                         SizedBox(
-                          height: 24 * scale,
+                          height:
+                              24 * scale,
                         ),
+
                         _DateSelector(
-                          text: isWeekly
-                              ? _thaiWeekRange(
-                                  selectedWeekStart,
-                                )
-                              : _thaiDate(
-                                  selectedDay,
-                                ),
-                          scale: scale,
+                          text:
+                              isWeekly
+                                  ? _thaiWeekRange(
+                                      selectedWeekStart,
+                                    )
+                                  : _thaiDate(
+                                      selectedDay,
+                                    ),
+
+                          scale:
+                              scale,
+
                           onPrevious:
                               _goPrevious,
-                          onTap: isWeekly
-                              ? _showWeekPicker
-                              : _pickDay,
+
+                          onTap:
+                              isWeekly
+                                  ? _showWeekPicker
+                                  : _pickDay,
+
                           showDownIcon:
                               isWeekly,
                         ),
+
                         SizedBox(
-                          height: 18 * scale,
+                          height:
+                              18 * scale,
                         ),
+
                         _OverviewCard(
                           title:
                               overviewTitle,
+
                           firstTitle:
                               firstTitle,
+
                           firstValue:
                               firstValue,
+
                           goalValue:
-                              dailyGoalMl,
+                              displayGoal,
+
                           percent:
                               percent,
+
                           remaining:
                               remaining,
-                          scale: scale,
+
+                          scale:
+                              scale,
+
                           isWeekly:
                               isWeekly,
                         ),
+
                         SizedBox(
-                          height: 22 * scale,
+                          height:
+                              22 * scale,
                         ),
+
                         _ChartCard(
                           values:
                               chartValues,
+
                           labels:
                               chartLabels,
+
                           goal:
-                              dailyGoalMl,
-                          scale: scale,
+                              isWeekly
+                                  ? weeklyGoalMl
+                                  : dailyGoalMl,
+
+                          scale:
+                              scale,
+
                           isWeekly:
                               isWeekly,
                         ),
                       ],
                     ),
                   ),
+
                   Positioned(
                     left: 0,
                     right: 0,
-                    bottom: 20 * scale,
-                    child: _BottomNav(
-                      scale: scale,
+                    bottom:
+                        20 * scale,
+
+                    child:
+                        _BottomNav(
+                      scale:
+                          scale,
                     ),
                   ),
                 ],
@@ -1430,7 +1850,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
     DateTime date,
   ) {
     final cleanDate =
-        _dateOnly(date);
+        _dateOnly(
+      date,
+    );
 
     return cleanDate.subtract(
       Duration(
@@ -1452,7 +1874,9 @@ class _StatisticsPageState extends State<StatisticsPage> {
   static String _dateKey(
     DateTime date,
   ) {
-    return '${date.year}-${_two(date.month)}-${_two(date.day)}';
+    return '${date.year}-'
+        '${_two(date.month)}-'
+        '${_two(date.day)}';
   }
 
   static String _two(
@@ -1460,7 +1884,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
   ) {
     return value
         .toString()
-        .padLeft(2, '0');
+        .padLeft(
+          2,
+          '0',
+        );
   }
 
   static int _toInt(
@@ -1484,17 +1911,22 @@ class _StatisticsPageState extends State<StatisticsPage> {
     }
 
     if (value is String) {
-      final text = value.trim();
+      final text =
+          value.trim();
 
       final asInt =
-          int.tryParse(text);
+          int.tryParse(
+        text,
+      );
 
       if (asInt != null) {
         return asInt;
       }
 
       final asDouble =
-          double.tryParse(text);
+          double.tryParse(
+        text,
+      );
 
       if (asDouble != null) {
         return asDouble.round();
@@ -1514,7 +1946,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
     return ((drank / goal) * 100)
         .round()
-        .clamp(0, 100)
+        .clamp(
+          0,
+          100,
+        )
         .toInt();
   }
 
@@ -1535,14 +1970,19 @@ class _StatisticsPageState extends State<StatisticsPage> {
   static String _thaiDate(
     DateTime date,
   ) {
-    return '${date.day} ${_thaiMonth(date.month)} ${date.year + 543}';
+    return '${date.day} '
+        '${_thaiMonth(date.month)} '
+        '${date.year + 543}';
   }
 
   static String _thaiWeekRange(
     DateTime start,
   ) {
-    final end = start.add(
-      const Duration(days: 6),
+    final end =
+        start.add(
+      const Duration(
+        days: 6,
+      ),
     );
 
     final buddhistYear =
@@ -1550,11 +1990,16 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
     if (start.month ==
         end.month) {
-      return '${start.day}-${end.day} ${_thaiMonth(end.month)} $buddhistYear';
+      return '${start.day}-${end.day} '
+          '${_thaiMonth(end.month)} '
+          '$buddhistYear';
     }
 
-    return '${start.day} ${_thaiMonthShort(start.month)} - '
-        '${end.day} ${_thaiMonthShort(end.month)} $buddhistYear';
+    return '${start.day} '
+        '${_thaiMonthShort(start.month)} - '
+        '${end.day} '
+        '${_thaiMonthShort(end.month)} '
+        '$buddhistYear';
   }
 
   static String _thaiMonth(
@@ -1602,6 +2047,8 @@ class _StatisticsPageState extends State<StatisticsPage> {
   }
 
   static List<String> _dailyLabels() {
+    // 21:00 เป็นเวลาสิ้นสุดของรอบ 19:00-21:00
+    // จึงไม่สร้างแท่งแยกที่ 21:00
     return [
       '07:00',
       '09:00',
@@ -1610,14 +2057,14 @@ class _StatisticsPageState extends State<StatisticsPage> {
       '15:00',
       '17:00',
       '19:00',
-      '21:00',
     ];
   }
 
   static int _slotIndex(
     DateTime time,
   ) {
-    final hour = time.hour;
+    final hour =
+        time.hour;
 
     if (hour < 7) {
       return -1;
@@ -1647,11 +2094,14 @@ class _StatisticsPageState extends State<StatisticsPage> {
       return 5;
     }
 
+    // รอบสุดท้ายคือ 19:00-21:00
+    // ข้อมูลก่อน 21:00 อยู่ในแท่ง 19:00
     if (hour < 21) {
       return 6;
     }
 
-    return 7;
+    // หลัง 21:00 ไม่แสดงเป็นแท่งรายวัน
+    return -1;
   }
 
   static List<String> _weeklyLabels(
@@ -1670,19 +2120,23 @@ class _StatisticsPageState extends State<StatisticsPage> {
     return List.generate(
       7,
       (index) {
-        final day = start.add(
-          Duration(days: index),
+        final day =
+            start.add(
+          Duration(
+            days: index,
+          ),
         );
 
         return '${days[index]}\n'
-            '${day.day} ${_thaiMonthShort(day.month)}';
+            '${day.day} '
+            '${_thaiMonthShort(day.month)}';
       },
     );
   }
 }
 
 // ============================================================
-// MODEL
+// MODELS
 // ============================================================
 
 class _WaterHistoryRecord {
@@ -1712,7 +2166,8 @@ class _DayHistoryResult {
   final int latestVolumeMl;
   final bool hasRecords;
 
-  bool get hasData => hasRecords;
+  bool get hasData =>
+      hasRecords;
 }
 
 // ============================================================
@@ -1735,34 +2190,61 @@ class _ModeSwitch extends StatelessWidget {
     BuildContext context,
   ) {
     return Container(
-      width: 255 * scale,
-      height: 46 * scale,
-      decoration: BoxDecoration(
-        color: Colors.white,
+      width:
+          255 * scale,
+
+      height:
+          46 * scale,
+
+      decoration:
+          BoxDecoration(
+        color:
+            Colors.white,
+
         borderRadius:
             BorderRadius.circular(
           24 * scale,
         ),
       ),
+
       child: Row(
         children: [
           Expanded(
-            child: _ModeButton(
-              text: 'รายวัน',
-              active: !isWeekly,
-              scale: scale,
+            child:
+                _ModeButton(
+              text:
+                  'รายวัน',
+
+              active:
+                  !isWeekly,
+
+              scale:
+                  scale,
+
               onTap: () {
-                onChanged(false);
+                onChanged(
+                  false,
+                );
               },
             ),
           ),
+
           Expanded(
-            child: _ModeButton(
-              text: 'รายสัปดาห์',
-              active: isWeekly,
-              scale: scale,
+            child:
+                _ModeButton(
+              text:
+                  'รายสัปดาห์',
+
+              active:
+                  isWeekly,
+
+              scale:
+                  scale,
+
               onTap: () {
-                onChanged(true);
+                onChanged(
+                  true,
+                );
               },
             ),
           ),
@@ -1790,36 +2272,53 @@ class _ModeButton extends StatelessWidget {
     BuildContext context,
   ) {
     return GestureDetector(
-      onTap: onTap,
-      child: AnimatedContainer(
+      onTap:
+          onTap,
+
+      child:
+          AnimatedContainer(
         duration:
             const Duration(
-          milliseconds: 180,
+          milliseconds:
+              180,
         ),
+
         alignment:
             Alignment.center,
-        decoration: BoxDecoration(
-          color: active
-              ? const Color(
-                  0xFF4D7EF2,
-                )
-              : Colors.white,
+
+        decoration:
+            BoxDecoration(
+          color:
+              active
+                  ? const Color(
+                      0xFF4D7EF2,
+                    )
+                  : Colors.white,
+
           borderRadius:
               BorderRadius.circular(
             24 * scale,
           ),
         ),
+
         child: Text(
           text,
-          maxLines: 1,
-          style: TextStyle(
+
+          maxLines:
+              1,
+
+          style:
+              TextStyle(
             fontSize:
                 20 * scale,
+
             fontWeight:
                 FontWeight.w900,
-            color: active
-                ? Colors.white
-                : Colors.black,
+
+            color:
+                active
+                    ? Colors.white
+                    : Colors.black,
           ),
         ),
       ),
@@ -1854,57 +2353,86 @@ class _DateSelector extends StatelessWidget {
       child: Row(
         mainAxisSize:
             MainAxisSize.min,
+
         children: [
           IconButton(
             visualDensity:
                 VisualDensity.compact,
+
             onPressed:
                 onPrevious,
-            icon: Icon(
+
+            icon:
+                Icon(
               Icons.chevron_left,
+
               size:
                   32 * scale,
+
               color:
-                  _StatisticsPageState.blue,
+                  _StatisticsPageState
+                      .blue,
             ),
           ),
+
           GestureDetector(
-            onTap: onTap,
+            onTap:
+                onTap,
+
             child: Row(
               mainAxisSize:
                   MainAxisSize.min,
+
               children: [
                 Icon(
                   Icons.calendar_month,
+
                   size:
                       27 * scale,
+
                   color:
-                      _StatisticsPageState.blue,
+                      _StatisticsPageState
+                          .blue,
                 ),
+
                 SizedBox(
-                  width: 8 * scale,
+                  width:
+                      8 * scale,
                 ),
+
                 Text(
                   text,
-                  style: TextStyle(
+
+                  style:
+                      TextStyle(
                     fontSize:
                         19 * scale,
+
                     fontWeight:
                         FontWeight.w900,
+
                     color:
-                        _StatisticsPageState.blue,
+                        _StatisticsPageState
+                            .blue,
                   ),
                 ),
+
                 if (showDownIcon) ...[
                   SizedBox(
-                    width: 6 * scale,
+                    width:
+                        6 * scale,
                   ),
+
                   Icon(
-                    Icons.keyboard_arrow_down,
+                    Icons
+                        .keyboard_arrow_down,
+
                     size:
                         24 * scale,
+
                     color:
-                        _StatisticsPageState.blue,
+                        _StatisticsPageState
+                            .blue,
                   ),
                 ],
               ],
@@ -1915,9 +2443,8 @@ class _DateSelector extends StatelessWidget {
     );
   }
 }
-
 // ============================================================
-// OVERVIEW
+// OVERVIEW CARD
 // ============================================================
 
 class _OverviewCard extends StatelessWidget {
@@ -1934,12 +2461,10 @@ class _OverviewCard extends StatelessWidget {
 
   final String title;
   final String firstTitle;
-
   final int firstValue;
   final int goalValue;
   final int percent;
   final int remaining;
-
   final double scale;
   final bool isWeekly;
 
@@ -1949,19 +2474,22 @@ class _OverviewCard extends StatelessWidget {
   ) {
     return Container(
       width: double.infinity,
-      padding:
-          EdgeInsets.fromLTRB(
+
+      padding: EdgeInsets.fromLTRB(
         18 * scale,
         18 * scale,
         18 * scale,
         24 * scale,
       ),
+
       decoration: BoxDecoration(
         color: Colors.white,
+
         borderRadius:
             BorderRadius.circular(
           24 * scale,
         ),
+
         boxShadow: [
           BoxShadow(
             color:
@@ -1969,37 +2497,47 @@ class _OverviewCard extends StatelessWidget {
               0.12,
             ),
             blurRadius: 14,
-            offset:
-                const Offset(
+            offset: const Offset(
               0,
               8,
             ),
           ),
         ],
       ),
+
       child: Column(
         mainAxisSize:
             MainAxisSize.min,
+
         children: [
           Row(
             children: [
               Icon(
                 Icons.water_drop,
+
                 color:
                     const Color(
                   0xFF008DD8,
                 ),
-                size: 30 * scale,
+
+                size:
+                    30 * scale,
               ),
+
               SizedBox(
-                width: 8 * scale,
+                width:
+                    8 * scale,
               ),
+
               Expanded(
                 child: Text(
                   title,
-                  style: TextStyle(
+
+                  style:
+                      TextStyle(
                     fontSize:
                         23 * scale,
+
                     fontWeight:
                         FontWeight.w900,
                   ),
@@ -2007,91 +2545,135 @@ class _OverviewCard extends StatelessWidget {
               ),
             ],
           ),
+
           SizedBox(
-            height: 20 * scale,
+            height:
+                20 * scale,
           ),
+
           Row(
             crossAxisAlignment:
                 CrossAxisAlignment.start,
+
             children: [
               Expanded(
-                child: _SummaryItem(
+                child:
+                    _SummaryItem(
                   icon:
                       Icons.local_drink_outlined,
+
                   title:
                       firstTitle,
+
                   value:
                       firstValue,
-                  unit: 'ml',
+
+                  unit:
+                      'ml',
+
                   scale:
                       scale,
                 ),
               ),
+
               _DividerLine(
-                scale: scale,
+                scale:
+                    scale,
               ),
+
               Expanded(
-                child: _SummaryItem(
+                child:
+                    _SummaryItem(
                   icon:
                       Icons.track_changes,
+
                   title:
                       'เป้าหมาย',
+
                   value:
                       goalValue,
-                  unit: 'ml',
+
+                  unit:
+                      'ml',
+
                   scale:
                       scale,
                 ),
               ),
+
               _DividerLine(
-                scale: scale,
+                scale:
+                    scale,
               ),
+
               Expanded(
-                child: _SummaryItem(
+                child:
+                    _SummaryItem(
                   icon:
                       Icons.water_drop,
+
                   title:
                       'เปอร์เซ็นต์',
+
                   value:
                       percent,
-                  unit: '%',
+
+                  unit:
+                      '%',
+
                   scale:
                       scale,
                 ),
               ),
             ],
           ),
+
           SizedBox(
-            height: 22 * scale,
+            height:
+                22 * scale,
           ),
+
           _ProgressBar(
-            percent: percent,
-            scale: scale,
+            percent:
+                percent,
+
+            scale:
+                scale,
           ),
+
           SizedBox(
-            height: 12 * scale,
+            height:
+                12 * scale,
           ),
+
           Padding(
             padding:
                 EdgeInsets.symmetric(
               horizontal:
                   6 * scale,
             ),
+
             child: Text(
               isWeekly
                   ? 'ดื่มได้เฉลี่ย '
-                      '${_StatisticsPageState._formatNumber(firstValue)} ml '
-                      'จากเป้าหมาย '
-                      '${_StatisticsPageState._formatNumber(goalValue)} ml ต่อวัน'
+                      '${_StatisticsPageState._formatNumber(firstValue)} ml ต่อวัน '
+                      'จากเป้าหมายรวม '
+                      '${_StatisticsPageState._formatNumber(goalValue)} ml ต่อสัปดาห์'
                   : 'เหลืออีก '
                       '${_StatisticsPageState._formatNumber(remaining)} ml '
                       'เพื่อให้ถึงเป้าหมาย',
+
               textAlign:
                   TextAlign.center,
-              style: TextStyle(
+
+              style:
+                  TextStyle(
                 fontSize:
                     15 * scale,
-                height: 1.25,
+
+                height:
+                    1.25,
+
                 color:
                     Colors.black87,
               ),
@@ -2131,75 +2713,116 @@ class _SummaryItem extends StatelessWidget {
         CircleAvatar(
           radius:
               38 * scale,
+
           backgroundColor:
-              _StatisticsPageState.softBlue,
+              _StatisticsPageState
+                  .softBlue,
+
           child: Icon(
             icon,
+
             size:
                 42 * scale,
+
             color:
                 const Color(
               0xFF078BD2,
             ),
           ),
         ),
+
         SizedBox(
-          height: 12 * scale,
+          height:
+              12 * scale,
         ),
+
         SizedBox(
-          height: 42 * scale,
+          height:
+              42 * scale,
+
           child: Center(
             child: Text(
               title,
-              maxLines: 2,
+
+              maxLines:
+                  2,
+
               textAlign:
                   TextAlign.center,
-              style: TextStyle(
+
+              style:
+                  TextStyle(
                 fontSize:
                     15.5 * scale,
-                height: 1.15,
+
+                height:
+                    1.15,
+
                 color:
                     Colors.black87,
               ),
             ),
           ),
         ),
+
         SizedBox(
-          height: 8 * scale,
+          height:
+              8 * scale,
         ),
+
         FittedBox(
           fit:
               BoxFit.scaleDown,
+
           child: Text(
             _StatisticsPageState
                 ._formatNumber(
               value,
             ),
-            maxLines: 1,
-            style: TextStyle(
+
+            maxLines:
+                1,
+
+            style:
+                TextStyle(
               fontSize:
                   35 * scale,
+
               fontWeight:
                   FontWeight.w900,
+
               color:
-                  _StatisticsPageState.blue,
-              height: 1,
+                  _StatisticsPageState
+                      .blue,
+
+              height:
+                  1,
             ),
           ),
         ),
+
         SizedBox(
-          height: 5 * scale,
+          height:
+              5 * scale,
         ),
+
         Text(
           unit,
-          style: TextStyle(
+
+          style:
+              TextStyle(
             fontSize:
                 21 * scale,
+
             fontWeight:
                 FontWeight.w900,
+
             color:
-                _StatisticsPageState.blue,
-            height: 1,
+                _StatisticsPageState
+                    .blue,
+
+            height:
+                1,
           ),
         ),
       ],
@@ -2208,7 +2831,7 @@ class _SummaryItem extends StatelessWidget {
 }
 
 // ============================================================
-// DIVIDER
+// DIVIDER LINE
 // ============================================================
 
 class _DividerLine extends StatelessWidget {
@@ -2223,14 +2846,18 @@ class _DividerLine extends StatelessWidget {
     BuildContext context,
   ) {
     return Container(
-      width: 1,
+      width:
+          1,
+
       height:
           155 * scale,
+
       margin:
           EdgeInsets.symmetric(
         horizontal:
             4 * scale,
       ),
+
       color:
           const Color(
         0xFF9EAABD,
@@ -2240,7 +2867,7 @@ class _DividerLine extends StatelessWidget {
 }
 
 // ============================================================
-// PROGRESS
+// PROGRESS BAR
 // ============================================================
 
 class _ProgressBar extends StatelessWidget {
@@ -2256,12 +2883,22 @@ class _ProgressBar extends StatelessWidget {
   Widget build(
     BuildContext context,
   ) {
+    final safePercent =
+        percent.clamp(
+      0,
+      100,
+    );
+
     return ClipRRect(
       borderRadius:
-          BorderRadius.circular(99),
+          BorderRadius.circular(
+        99,
+      ),
+
       child: SizedBox(
         height:
             18 * scale,
+
         child: Stack(
           children: [
             Container(
@@ -2270,14 +2907,11 @@ class _ProgressBar extends StatelessWidget {
                 0xFFA7B1BF,
               ),
             ),
+
             FractionallySizedBox(
               widthFactor:
-                  (percent / 100)
-                      .clamp(
-                        0.0,
-                        1.0,
-                      )
-                      .toDouble(),
+                  safePercent / 100,
+
               child: Container(
                 color:
                     const Color(
@@ -2285,14 +2919,19 @@ class _ProgressBar extends StatelessWidget {
                 ),
               ),
             ),
+
             Center(
               child: Text(
-                '$percent%',
-                style: TextStyle(
+                '$safePercent%',
+
+                style:
+                    TextStyle(
                   color:
                       Colors.white,
+
                   fontSize:
                       12 * scale,
+
                   fontWeight:
                       FontWeight.bold,
                 ),
@@ -2331,6 +2970,7 @@ class _ChartCard extends StatelessWidget {
     return Container(
       width:
           double.infinity,
+
       padding:
           EdgeInsets.fromLTRB(
         18 * scale,
@@ -2338,22 +2978,27 @@ class _ChartCard extends StatelessWidget {
         18 * scale,
         22 * scale,
       ),
+
       decoration:
           BoxDecoration(
         color:
             Colors.white,
+
         borderRadius:
             BorderRadius.circular(
           24 * scale,
         ),
+
         boxShadow: [
           BoxShadow(
             color:
                 Colors.black.withOpacity(
               0.12,
             ),
+
             blurRadius:
                 14,
+
             offset:
                 const Offset(
               0,
@@ -2362,29 +3007,39 @@ class _ChartCard extends StatelessWidget {
           ),
         ],
       ),
+
       child: Column(
         children: [
           Row(
             children: [
               Icon(
                 Icons.water_drop,
+
                 color:
                     const Color(
                   0xFF008DD8,
                 ),
+
                 size:
                     30 * scale,
               ),
+
               SizedBox(
                 width:
                     8 * scale,
               ),
+
               Expanded(
                 child: Text(
-                  'กราฟปริมาณน้ำที่ดื่ม',
-                  style: TextStyle(
+                  isWeekly
+                      ? 'กราฟปริมาณน้ำที่ดื่มรายวันในสัปดาห์'
+                      : 'กราฟปริมาณน้ำที่ดื่ม',
+
+                  style:
+                      TextStyle(
                     fontSize:
                         22 * scale,
+
                     fontWeight:
                         FontWeight.w800,
                   ),
@@ -2392,67 +3047,85 @@ class _ChartCard extends StatelessWidget {
               ),
             ],
           ),
+
           SizedBox(
             height:
                 20 * scale,
           ),
+
           SizedBox(
             height:
                 280 * scale,
+
             width:
                 double.infinity,
-            child: CustomPaint(
+
+            child:
+                CustomPaint(
               key: ValueKey(
                 '${isWeekly ? "week" : "day"}-${values.join("-")}',
               ),
+
               painter:
                   _BarChartPainter(
                 values:
                     List<int>.from(
                   values,
                 ),
+
                 labels:
                     List<String>.from(
                   labels,
                 ),
+
                 goal:
                     goal,
+
                 isWeekly:
                     isWeekly,
               ),
             ),
           ),
+
           SizedBox(
             height:
                 10 * scale,
           ),
+
           Row(
             mainAxisAlignment:
                 MainAxisAlignment.center,
+
             children: [
               Container(
                 width:
                     14 * scale,
+
                 height:
                     14 * scale,
+
                 decoration:
                     BoxDecoration(
                   color:
                       const Color(
                     0xFF3B96D4,
                   ),
+
                   borderRadius:
                       BorderRadius.circular(
                     4,
                   ),
                 ),
               ),
+
               SizedBox(
                 width:
                     8 * scale,
               ),
+
               Text(
                 'ปริมาณน้ำที่ดื่ม (ml)',
+
                 style:
                     TextStyle(
                   fontSize:
@@ -2468,7 +3141,7 @@ class _ChartCard extends StatelessWidget {
 }
 
 // ============================================================
-// BAR CHART
+// BAR CHART PAINTER
 // ============================================================
 
 class _BarChartPainter extends CustomPainter {
@@ -2489,26 +3162,33 @@ class _BarChartPainter extends CustomPainter {
     Canvas canvas,
     Size size,
   ) {
-    const double leftPad = 46.0;
-    const double topPad = 20.0;
-    const double rightPad = 8.0;
-    const double bottomPad = 55.0;
+    const double leftPad =
+        46.0;
+
+    const double topPad =
+        20.0;
+
+    const double rightPad =
+        8.0;
+
+    const double bottomPad =
+        55.0;
 
     final chartWidth =
         math.max(
-          1.0,
-          size.width -
-              leftPad -
-              rightPad,
-        ).toDouble();
+      1.0,
+      size.width -
+          leftPad -
+          rightPad,
+    ).toDouble();
 
     final chartHeight =
         math.max(
-          1.0,
-          size.height -
-              topPad -
-              bottomPad,
-        ).toDouble();
+      1.0,
+      size.height -
+          topPad -
+          bottomPad,
+    ).toDouble();
 
     int maxData = 0;
 
@@ -2521,65 +3201,79 @@ class _BarChartPainter extends CustomPainter {
     int baseMax;
 
     if (isWeekly) {
+      // แต่ละแท่งของกราฟรายสัปดาห์คือปริมาณที่ดื่ม "ต่อวัน"
+      // จึงใช้สเกลต่อวัน ไม่ใช้เป้าหมายรวม 7 วัน
       baseMax =
           math.max(
-        dailySafeGoal(goal),
+        2000,
         maxData,
       );
     } else {
-      baseMax =
-          math.max(
-        400,
-        maxData,
-      );
+      // กราฟรายวันกำหนดแกน Y คงที่ 0-2000 mL
+      baseMax = 2000;
     }
 
-    const int step = 200;
+    const int step =
+        200;
 
     double roundedMax =
-        ((baseMax / step).ceil() *
-                step)
+        ((baseMax / step).ceil() * step)
             .toDouble();
 
     if (roundedMax <= 0) {
       roundedMax =
-          isWeekly ? 1400 : 400;
+          isWeekly
+              ? 1400
+              : 2000;
     }
 
     final gridPaint =
         Paint()
           ..color =
               Colors.grey.shade300
-          ..strokeWidth = 1;
+          ..strokeWidth =
+              1;
 
     final axisPaint =
         Paint()
           ..color =
               Colors.grey.shade500
-          ..strokeWidth = 1;
+          ..strokeWidth =
+              1;
 
     final textPainter =
         TextPainter(
       textDirection:
           TextDirection.ltr,
+
       textAlign:
           TextAlign.center,
     );
 
-    const int gridCount = 4;
+    // ทั้งรายวันและรายสัปดาห์:
+    // ถ้าสเกลสูงสุด 2000 จะได้ 0, 200, 400, ... 2000 mL
+    const int gridCount =
+        10;
 
-    for (int i = 0;
-        i <= gridCount;
-        i++) {
+    for (
+      int i = 0;
+      i <= gridCount;
+      i++
+    ) {
       final y =
           topPad +
-          (chartHeight / gridCount) *
+          (chartHeight /
+                  gridCount) *
               i;
 
       canvas.drawLine(
-        Offset(leftPad, y),
         Offset(
-          leftPad + chartWidth,
+          leftPad,
+          y,
+        ),
+        Offset(
+          leftPad +
+              chartWidth,
           y,
         ),
         gridPaint,
@@ -2596,9 +3290,12 @@ class _BarChartPainter extends CustomPainter {
           TextSpan(
         text:
             '$labelValue',
+
         style:
             const TextStyle(
-          fontSize: 10,
+          fontSize:
+              10,
+
           color:
               Colors.black87,
         ),
@@ -2622,11 +3319,14 @@ class _BarChartPainter extends CustomPainter {
     canvas.drawLine(
       Offset(
         leftPad,
-        topPad + chartHeight,
+        topPad +
+            chartHeight,
       ),
       Offset(
-        leftPad + chartWidth,
-        topPad + chartHeight,
+        leftPad +
+            chartWidth,
+        topPad +
+            chartHeight,
       ),
       axisPaint,
     );
@@ -2642,32 +3342,51 @@ class _BarChartPainter extends CustomPainter {
     }
 
     final groupWidth =
-        chartWidth / count;
+        chartWidth /
+        count;
 
     final barWidth =
         isWeekly
             ? math.min(
                 30.0,
-                groupWidth * 0.58,
+                groupWidth *
+                    0.58,
               )
             : math.min(
                 25.0,
-                groupWidth * 0.55,
+                groupWidth *
+                    0.55,
               );
 
     final weeklyColors = [
-      const Color(0xFFFF525A),
-      const Color(0xFFFFD54F),
-      const Color(0xFFF38BDA),
-      const Color(0xFF80D982),
-      const Color(0xFFFFB74D),
-      const Color(0xFF90CAF9),
-      const Color(0xFF64B5F6),
+      const Color(
+        0xFFFF525A,
+      ),
+      const Color(
+        0xFFFFD54F,
+      ),
+      const Color(
+        0xFFF38BDA,
+      ),
+      const Color(
+        0xFF80D982,
+      ),
+      const Color(
+        0xFFFFB74D,
+      ),
+      const Color(
+        0xFF90CAF9,
+      ),
+      const Color(
+        0xFF64B5F6,
+      ),
     ];
 
-    for (int i = 0;
-        i < count;
-        i++) {
+    for (
+      int i = 0;
+      i < count;
+      i++
+    ) {
       int value =
           values[i];
 
@@ -2690,12 +3409,14 @@ class _BarChartPainter extends CustomPainter {
 
       if (value > 0 &&
           barHeight < 3) {
-        barHeight = 3;
+        barHeight =
+            3;
       }
 
       final x =
           leftPad +
-          (groupWidth * i) +
+          (groupWidth *
+              i) +
           ((groupWidth -
                   barWidth) /
               2);
@@ -2713,7 +3434,8 @@ class _BarChartPainter extends CustomPainter {
                       ? weeklyColors[
                           i %
                               weeklyColors
-                                  .length]
+                                  .length
+                        ]
                       : const Color(
                           0xFF3B96D4,
                         );
@@ -2726,7 +3448,9 @@ class _BarChartPainter extends CustomPainter {
             barWidth,
             barHeight,
           ),
-          const Radius.circular(6),
+          const Radius.circular(
+            6,
+          ),
         );
 
         canvas.drawRRect(
@@ -2736,12 +3460,17 @@ class _BarChartPainter extends CustomPainter {
 
         textPainter.text =
             TextSpan(
-          text: '$value',
+          text:
+              '$value',
+
           style:
               const TextStyle(
-            fontSize: 9.5,
+            fontSize:
+                9.5,
+
             fontWeight:
                 FontWeight.bold,
+
             color:
                 Color(
               0xFF2878C9,
@@ -2773,13 +3502,19 @@ class _BarChartPainter extends CustomPainter {
 
       textPainter.text =
           TextSpan(
-        text: labels[i],
+        text:
+            labels[i],
+
         style:
             const TextStyle(
-          fontSize: 9.5,
+          fontSize:
+              9.5,
+
           color:
               Colors.black87,
-          height: 1.15,
+
+          height:
+              1.15,
         ),
       );
 
@@ -2792,7 +3527,8 @@ class _BarChartPainter extends CustomPainter {
         canvas,
         Offset(
           leftPad +
-              (groupWidth * i) +
+              (groupWidth *
+                  i) +
               ((groupWidth -
                       textPainter.width) /
                   2),
@@ -2805,9 +3541,14 @@ class _BarChartPainter extends CustomPainter {
 
     textPainter.text =
         const TextSpan(
-      text: '(ml)',
-      style: TextStyle(
-        fontSize: 10.5,
+      text:
+          '(ml)',
+
+      style:
+          TextStyle(
+        fontSize:
+            10.5,
+
         color:
             Colors.black87,
       ),
@@ -2817,24 +3558,21 @@ class _BarChartPainter extends CustomPainter {
 
     textPainter.paint(
       canvas,
-      const Offset(0, 0),
+      const Offset(
+        0,
+        0,
+      ),
     );
   }
 
-  static int dailySafeGoal(
-    int goal,
-  ) {
-    if (goal <= 0) {
-      return 1400;
-    }
-
-    return goal;
-  }
+  
+    // ============================================================
+  // SHOULD REPAINT   
+  // ============================================================
 
   @override
   bool shouldRepaint(
-    covariant _BarChartPainter
-        oldDelegate,
+    covariant _BarChartPainter oldDelegate,
   ) {
     if (oldDelegate.goal != goal) {
       return true;
@@ -2850,11 +3588,29 @@ class _BarChartPainter extends CustomPainter {
       return true;
     }
 
-    for (int i = 0;
-        i < values.length;
-        i++) {
+    for (
+      int i = 0;
+      i < values.length;
+      i++
+    ) {
       if (oldDelegate.values[i] !=
           values[i]) {
+        return true;
+      }
+    }
+
+    if (oldDelegate.labels.length !=
+        labels.length) {
+      return true;
+    }
+
+    for (
+      int i = 0;
+      i < labels.length;
+      i++
+    ) {
+      if (oldDelegate.labels[i] !=
+          labels[i]) {
         return true;
       }
     }
@@ -2864,7 +3620,7 @@ class _BarChartPainter extends CustomPainter {
 }
 
 // ============================================================
-// BOTTOM NAV
+// BOTTOM NAVIGATION
 // ============================================================
 
 class _BottomNav extends StatelessWidget {
@@ -2882,24 +3638,30 @@ class _BottomNav extends StatelessWidget {
       child: Container(
         width:
             255 * scale,
+
         height:
             72 * scale,
+
         decoration:
             BoxDecoration(
           color:
               Colors.white,
+
           borderRadius:
               BorderRadius.circular(
             42 * scale,
           ),
+
           boxShadow: [
             BoxShadow(
               color:
                   Colors.black.withOpacity(
                 0.16,
               ),
+
               blurRadius:
                   16,
+
               offset:
                   const Offset(
                 0,
@@ -2908,14 +3670,21 @@ class _BottomNav extends StatelessWidget {
             ),
           ],
         ),
+
         child: Row(
           children: [
+            // ==================================================
+            // HOME
+            // ==================================================
+
             Expanded(
-              child: InkWell(
+              child:
+                  InkWell(
                 borderRadius:
                     BorderRadius.circular(
                   42 * scale,
                 ),
+
                 onTap: () {
                   Navigator.pushReplacement(
                     context,
@@ -2925,25 +3694,33 @@ class _BottomNav extends StatelessWidget {
                     ),
                   );
                 },
+
                 child: Column(
                   mainAxisAlignment:
                       MainAxisAlignment.center,
+
                   children: [
                     Icon(
                       Icons.home,
+
                       size:
                           32 * scale,
+
                       color:
                           Colors.grey.shade500,
                     ),
+
                     Text(
                       'หน้าแรก',
+
                       style:
                           TextStyle(
                         fontSize:
                             14 * scale,
+
                         fontWeight:
                             FontWeight.bold,
+
                         color:
                             Colors.grey.shade500,
                       ),
@@ -2952,26 +3729,38 @@ class _BottomNav extends StatelessWidget {
                 ),
               ),
             ),
+
+            // ==================================================
+            // STATISTICS
+            // ==================================================
+
             Expanded(
               child: Column(
                 mainAxisAlignment:
                     MainAxisAlignment.center,
+
                 children: [
                   Icon(
                     Icons.bar_chart,
+
                     size:
                         36 * scale,
+
                     color:
                         _StatisticsPageState.blue,
                   ),
+
                   Text(
                     'สถิติ',
+
                     style:
                         TextStyle(
                       fontSize:
                           14 * scale,
+
                       fontWeight:
                           FontWeight.bold,
+
                       color:
                           _StatisticsPageState.blue,
                     ),

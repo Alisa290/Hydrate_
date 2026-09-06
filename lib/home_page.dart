@@ -33,22 +33,29 @@ class _HomePageState extends State<HomePage> {
   int bottleLevelPercent = 0;
 
   // =====================================================
-  // "เหลืออีก" จาก water_history
+  // ข้อมูลการดื่ม "เฉพาะวันนี้"
   // =====================================================
-  int latestHistoryVolumeMl = 0;
+  int todayConsumedMl = 0;
 
   int lastUpdatedTimestamp = 0;
 
   bool hasBottleData = false;
-  bool hasHistoryVolumeData = false;
+  bool isBottleConnected = false;
+  bool hasHistoryVolumeData = true;
   bool isLoading = true;
+
+  // วันที่ที่หน้า Home กำลังฟัง water_history อยู่
+  String listeningHistoryDateKey = '';
 
   String nextDrinkTimeText = '07:00 น.';
 
   Timer? reminderTimer;
 
   StreamSubscription<DatabaseEvent>? bottleSubscription;
+  StreamSubscription<DatabaseEvent>? pairingSubscription;
   StreamSubscription<DatabaseEvent>? historySubscription;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? healthProfileSubscription;
+  String? _lastHealthSignature;
 
   // =====================================================
   // REALTIME DATABASE URL
@@ -57,10 +64,23 @@ class _HomePageState extends State<HomePage> {
       'https://hydrate-smart-dc6b9-default-rtdb.asia-southeast1.firebasedatabase.app';
 
   // =====================================================
-  // UID ที่ ESP32 ใช้บันทึกข้อมูล
+  // ใช้ UID ของบัญชีที่กำลัง Login
+  // ไม่ใช้ UID แบบตายตัว
   // =====================================================
-  static const String bottleUserId =
-      'jE9aQG2EgtMRFLb8lKaqRpIf1QH3';
+  String? get currentUserId =>
+      FirebaseAuth.instance.currentUser?.uid;
+
+  // =====================================================
+  // เป้าหมายการดื่มต่อ 2 ชั่วโมงของผู้ใช้ปัจจุบัน
+  // ช่วงดื่ม 07:00-21:00 คิดเป็น 15 ชั่วโมงตามกติกาโปรเจกต์
+  // =====================================================
+  int get twoHourDrinkTargetMl {
+    if (dailyGoalMl <= 0) {
+      return 0;
+    }
+
+    return ((dailyGoalMl / 15.0) * 2.0).round();
+  }
 
   // =====================================================
   // DEVICE ID
@@ -76,10 +96,13 @@ class _HomePageState extends State<HomePage> {
 
     loadDailyGoal();
 
-    // อ่านระดับน้ำในขวดจาก ESP32
-    listenBottleData();
+    // ฟังการเปลี่ยนข้อมูลสุขภาพ เพื่อคำนวณเป้าหมายใหม่ทันที
+    listenHealthProfileChanges();
 
-    // อ่านค่า "เหลืออีก"
+    // ตรวจสอบก่อนว่าผู้ใช้คนนี้เชื่อมต่อกับขวดหรือยัง
+    listenBottleConnectionStatus();
+
+    // อ่านข้อมูลการดื่มของวันนี้
     listenLatestWaterHistory();
 
     updateNextDrinkTime();
@@ -88,8 +111,64 @@ class _HomePageState extends State<HomePage> {
       const Duration(seconds: 30),
       (_) {
         updateNextDrinkTime();
+
+        // เช็กว่าเปลี่ยนวันหรือยัง
+        _checkNewDay();
       },
     );
+  }
+
+  // =====================================================
+  // วันที่วันนี้ในรูปแบบ YYYY-MM-DD
+  // =====================================================
+  String _getTodayDateKey() {
+    final now = DateTime.now();
+
+    return '${now.year.toString().padLeft(4, '0')}-'
+        '${now.month.toString().padLeft(2, '0')}-'
+        '${now.day.toString().padLeft(2, '0')}';
+  }
+
+  // =====================================================
+  // เช็กการเปลี่ยนวัน
+  //
+  // เมื่อขึ้นวันใหม่:
+  // - ดื่มแล้ว = 0 ML
+  // - เหลืออีก = เป้าหมายเต็ม
+  // - กราฟ = 0%
+  // - เปลี่ยน listener ไปอ่าน water_history ของวันใหม่
+  // =====================================================
+  void _checkNewDay() {
+    final todayKey = _getTodayDateKey();
+
+    if (listeningHistoryDateKey.isEmpty) {
+      return;
+    }
+
+    if (todayKey == listeningHistoryDateKey) {
+      return;
+    }
+
+    debugPrint('');
+    debugPrint('================================');
+    debugPrint('NEW DAY DETECTED');
+    debugPrint(
+      '$listeningHistoryDateKey -> $todayKey',
+    );
+    debugPrint('RESET DAILY DRINK DATA');
+    debugPrint('================================');
+
+    if (mounted) {
+      setState(() {
+        todayConsumedMl = 0;
+        hasHistoryVolumeData = true;
+      });
+    }
+
+    historySubscription?.cancel();
+    healthProfileSubscription?.cancel();
+
+    listenLatestWaterHistory();
   }
 
   // =====================================================
@@ -99,6 +178,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     reminderTimer?.cancel();
     bottleSubscription?.cancel();
+    pairingSubscription?.cancel();
     historySubscription?.cancel();
 
     super.dispose();
@@ -142,70 +222,114 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =====================================================
-  // ดื่มแล้ว ML
-  //
-  // สูตร:
-  // เป้าหมายวันนี้ - เหลืออีก
-  //
-  // ตัวอย่าง:
-  // 1200 - 1060 = 140 ML
+  // ดื่มแล้ววันนี้
   // =====================================================
   int get consumedMl {
-    if (!hasHistoryVolumeData || dailyGoalMl <= 0) {
+    if (dailyGoalMl <= 0) {
       return 0;
     }
 
-    final value = dailyGoalMl - latestHistoryVolumeMl;
-
-    return value.clamp(0, dailyGoalMl);
+    return todayConsumedMl.clamp(
+      0,
+      dailyGoalMl,
+    );
   }
 
   // =====================================================
-  // เปอร์เซ็นต์ที่ดื่มแล้ว
+  // เหลืออีกวันนี้
   //
   // สูตร:
-  // 100 - ระดับน้ำในขวด
-  //
-  // ตัวอย่าง:
-  //
-  // ระดับน้ำในขวด = 53%
-  //
-  // 100 - 53 = 47%
-  //
-  // ดังนั้น:
-  // ใต้กราฟ = 47%
-  // วงกลม = 47%
-  //
-  // ส่วน "ระดับน้ำในขวด" ยังคงเป็น 53%
+  // เป้าหมายวันนี้ - ดื่มแล้ววันนี้
   // =====================================================
-  int get graphPercent {
-    if (!hasBottleData) {
+  int get remainingMl {
+    if (dailyGoalMl <= 0) {
       return 0;
     }
 
-    final safeBottlePercent =
-        bottleLevelPercent.clamp(0, 100);
+    final value =
+        dailyGoalMl - consumedMl;
 
-    final drankPercent =
-        100 - safeBottlePercent;
-
-    return drankPercent.clamp(0, 100);
+    return value.clamp(
+      0,
+      dailyGoalMl,
+    );
   }
 
   // =====================================================
-  // Progress ของกราฟวงกลม
+  // เปอร์เซ็นต์ที่ดื่มแล้ว "วันนี้"
   //
-  // ถ้า graphPercent = 47
-  // progress = 0.47
+  // ตัวอย่าง:
+  // เป้าหมาย 1300 ML
+  // ดื่มแล้ว 650 ML
+  // = 50%
+  //
+  // เมื่อขึ้นวันใหม่ todayConsumedMl = 0
+  // กราฟจึงกลับเป็น 0%
   // =====================================================
-  double get graphProgress {
-    if (!hasBottleData) {
-      return 0.0;
+  int get graphPercent {
+    if (dailyGoalMl <= 0) {
+      return 0;
     }
 
+    final percent =
+        ((consumedMl / dailyGoalMl) * 100)
+            .round();
+
+    return percent.clamp(
+      0,
+      100,
+    );
+  }
+
+  // =====================================================
+  // Progress ของกราฟวงกลม 0.0 - 1.0
+  // =====================================================
+  double get graphProgress {
     return (graphPercent / 100.0)
-        .clamp(0.0, 1.0)
+        .clamp(
+          0.0,
+          1.0,
+        )
         .toDouble();
+  }
+
+  // =====================================================
+  // ส่งเป้าหมายรายวันไป Realtime Database ให้ ESP32 อ่านได้
+  // users/{uid}/drink_settings/daily_goal_ml
+  // =====================================================
+  Future<void> syncDailyGoalToRealtimeDatabase(
+    int goalMl,
+  ) async {
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null || goalMl <= 0) {
+      return;
+    }
+
+    try {
+      final database = getRealtimeDatabase();
+
+      final ref = database.ref(
+        'users/${user.uid}/drink_settings',
+      );
+
+      await ref.update({
+        'daily_goal_ml': goalMl,
+        'hourly_target_ml': dailyGoalMl > 0
+            ? (goalMl / 15.0)
+            : 0,
+        'two_hour_target_ml': (goalMl / 15.0) * 2.0,
+        'updated_at': ServerValue.timestamp,
+      });
+
+      debugPrint(
+        'RTDB drink goal synced: $goalMl ML/day | '
+        '${(goalMl / 15.0).toStringAsFixed(2)} ML/hour | '
+        '${((goalMl / 15.0) * 2.0).toStringAsFixed(2)} ML/2h',
+      );
+    } catch (e) {
+      debugPrint('Sync daily goal to RTDB error: $e');
+    }
   }
 
   // =====================================================
@@ -213,7 +337,8 @@ class _HomePageState extends State<HomePage> {
   // =====================================================
   Future<void> loadDailyGoal() async {
     try {
-      final user = FirebaseAuth.instance.currentUser;
+      final user =
+          FirebaseAuth.instance.currentUser;
 
       if (user == null) {
         if (mounted) {
@@ -225,10 +350,11 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
-      final doc = await FirebaseFirestore.instance
-          .collection('profiles')
-          .doc(user.uid)
-          .get();
+      final doc =
+          await FirebaseFirestore.instance
+              .collection('profiles')
+              .doc(user.uid)
+              .get();
 
       if (!doc.exists) {
         if (mounted) {
@@ -246,7 +372,9 @@ class _HomePageState extends State<HomePage> {
       // เป้าหมายที่ผู้ใช้ตั้งเอง
       // =================================================
       final manualGoal =
-          parseIntValue(data['manual_daily_goal_ml']);
+          parseIntValue(
+        data['manual_daily_goal_ml'],
+      );
 
       if (manualGoal > 0) {
         if (mounted) {
@@ -255,6 +383,9 @@ class _HomePageState extends State<HomePage> {
             isLoading = false;
           });
         }
+
+        // ส่งเป้าหมายของผู้ใช้คนนี้ให้ ESP32 ผ่าน RTDB
+        await syncDailyGoalToRealtimeDatabase(manualGoal);
 
         return;
       }
@@ -266,12 +397,16 @@ class _HomePageState extends State<HomePage> {
           (data['gender'] ?? '').toString();
 
       final heightCm =
-          parseIntValue(data['height_cm']);
+          parseIntValue(
+        data['height_cm'],
+      );
 
       final kidneyStage =
-          (data['kidney_stage'] ?? '').toString();
+          (data['kidney_stage'] ?? '')
+              .toString();
 
-      final calculatedGoal = calculateDailyGoal(
+      final calculatedGoal =
+          calculateDailyGoal(
         gender: gender,
         heightCm: heightCm,
         kidneyStage: kidneyStage,
@@ -279,10 +414,15 @@ class _HomePageState extends State<HomePage> {
 
       if (mounted) {
         setState(() {
-          dailyGoalMl = calculatedGoal;
+          dailyGoalMl =
+              calculatedGoal;
+
           isLoading = false;
         });
       }
+
+      // ส่งเป้าหมายที่คำนวณได้ของผู้ใช้คนนี้ให้ ESP32 ผ่าน RTDB
+      await syncDailyGoalToRealtimeDatabase(calculatedGoal);
     } catch (e) {
       debugPrint(
         'Load daily goal error: $e',
@@ -297,12 +437,149 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =====================================================
+  // ฟังข้อมูลสุขภาพของผู้ใช้แบบ Realtime
+  // เมื่อเพศ / ส่วนสูง / ระยะโรคไตเปลี่ยน จะคำนวณเป้าหมายใหม่ทันที
+  // =====================================================
+  void listenHealthProfileChanges() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    healthProfileSubscription?.cancel();
+    healthProfileSubscription = FirebaseFirestore.instance
+        .collection('profiles')
+        .doc(user.uid)
+        .snapshots()
+        .listen((doc) async {
+      if (!doc.exists) return;
+
+      final data = doc.data();
+      if (data == null) return;
+
+      final gender = (data['gender'] ?? '').toString();
+      final heightCm = parseIntValue(data['height_cm']);
+      final kidneyStage = (data['kidney_stage'] ?? '').toString();
+      final signature = '$gender|$heightCm|$kidneyStage';
+
+      // ครั้งแรกเก็บค่าไว้เฉย ๆ เพื่อไม่รบกวน logic เดิมของ loadDailyGoal()
+      if (_lastHealthSignature == null) {
+        _lastHealthSignature = signature;
+        return;
+      }
+
+      // ถ้าข้อมูลสุขภาพไม่ได้เปลี่ยน ไม่ต้องทำอะไร
+      if (_lastHealthSignature == signature) return;
+      _lastHealthSignature = signature;
+
+      final calculatedGoal = calculateDailyGoal(
+        gender: gender,
+        heightCm: heightCm,
+        kidneyStage: kidneyStage,
+      );
+
+      // ข้อมูลสุขภาพเปลี่ยน = ยกเลิกเป้าหมายที่เคยตั้งเอง
+      // เพื่อให้ระบบใช้ค่าที่คำนวณจากสุขภาพล่าสุด
+      await FirebaseFirestore.instance
+          .collection('profiles')
+          .doc(user.uid)
+          .update({
+        'manual_daily_goal_ml': FieldValue.delete(),
+      });
+
+      if (mounted) {
+        setState(() {
+          dailyGoalMl = calculatedGoal;
+        });
+      }
+
+      // ส่งค่าใหม่ให้ ESP32 ทันที
+      await syncDailyGoalToRealtimeDatabase(calculatedGoal);
+
+      debugPrint(
+        'Health profile changed -> recalculated daily goal: $calculatedGoal ML/day',
+      );
+    });
+  }
+
+  // =====================================================
   // REALTIME DATABASE INSTANCE
   // =====================================================
   FirebaseDatabase getRealtimeDatabase() {
     return FirebaseDatabase.instanceFor(
       app: Firebase.app(),
       databaseURL: databaseUrl,
+    );
+  }
+
+  // =====================================================
+  // ตรวจสอบสถานะการเชื่อมต่อขวด
+  // devices/bottle_001/active_user_id
+  // =====================================================
+  Future<void> listenBottleConnectionStatus() async {
+    final user = FirebaseAuth.instance.currentUser;
+
+    if (user == null) {
+      if (mounted) {
+        setState(() {
+          isBottleConnected = false;
+          hasBottleData = false;
+          currentBottleMl = 0;
+          bottleLevelPercent = 0;
+          lastUpdatedTimestamp = 0;
+        });
+      }
+      return;
+    }
+
+    final database = getRealtimeDatabase();
+    final ref = database.ref(
+      'devices/$bottleDeviceId/active_user_id',
+    );
+
+    await pairingSubscription?.cancel();
+
+    pairingSubscription = ref.onValue.listen(
+      (event) {
+        final activeUid =
+            event.snapshot.value?.toString().trim() ?? '';
+
+        final connected =
+            activeUid.isNotEmpty &&
+            activeUid == user.uid;
+
+        if (!mounted) return;
+
+        if (!connected) {
+          bottleSubscription?.cancel();
+          setState(() {
+            isBottleConnected = false;
+            hasBottleData = false;
+            currentBottleMl = 0;
+            bottleLevelPercent = 0;
+            lastUpdatedTimestamp = 0;
+          });
+          return;
+        }
+
+        final wasConnected = isBottleConnected;
+
+        setState(() {
+          isBottleConnected = true;
+        });
+
+        if (!wasConnected || bottleSubscription == null) {
+          listenBottleData();
+        }
+      },
+      onError: (error) {
+        if (!mounted) return;
+        setState(() {
+          isBottleConnected = false;
+          hasBottleData = false;
+          currentBottleMl = 0;
+          bottleLevelPercent = 0;
+          lastUpdatedTimestamp = 0;
+        });
+      },
     );
   }
 
@@ -320,14 +597,51 @@ class _HomePageState extends State<HomePage> {
   // =====================================================
   Future<void> listenBottleData() async {
     try {
+      final user =
+          FirebaseAuth.instance.currentUser;
+
+      if (user == null) {
+        debugPrint(
+          'listenBottleData: no logged-in user',
+        );
+
+        if (mounted) {
+          setState(() {
+            hasBottleData = false;
+            currentBottleMl = 0;
+            bottleLevelPercent = 0;
+            lastUpdatedTimestamp = 0;
+          });
+        }
+
+        return;
+      }
+
+      final String uid =
+          user.uid;
+
+      if (!isBottleConnected) {
+        if (mounted) {
+          setState(() {
+            hasBottleData = false;
+            currentBottleMl = 0;
+            bottleLevelPercent = 0;
+            lastUpdatedTimestamp = 0;
+          });
+        }
+        return;
+      }
+
       final database =
           getRealtimeDatabase();
 
       final String databasePath =
-          'users/$bottleUserId/devices/$bottleDeviceId';
+          'users/$uid/devices/$bottleDeviceId';
 
       final DatabaseReference ref =
-          database.ref(databasePath);
+          database.ref(
+        databasePath,
+      );
 
       debugPrint('');
       debugPrint(
@@ -337,7 +651,7 @@ class _HomePageState extends State<HomePage> {
         'LISTENING DEVICE DATA',
       );
       debugPrint(
-        'Bottle UID: $bottleUserId',
+        'Logged-in UID: $uid',
       );
       debugPrint(
         'Device ID: $bottleDeviceId',
@@ -375,7 +689,8 @@ class _HomePageState extends State<HomePage> {
         );
       }
 
-      await bottleSubscription?.cancel();
+      await bottleSubscription
+          ?.cancel();
 
       // =================================================
       // ฟังข้อมูลแบบ Realtime
@@ -402,7 +717,8 @@ class _HomePageState extends State<HomePage> {
 
             if (mounted) {
               setState(() {
-                hasBottleData = false;
+                hasBottleData =
+                    false;
               });
             }
 
@@ -420,7 +736,8 @@ class _HomePageState extends State<HomePage> {
 
           if (mounted) {
             setState(() {
-              hasBottleData = false;
+              hasBottleData =
+                  false;
             });
           }
         },
@@ -444,6 +761,18 @@ class _HomePageState extends State<HomePage> {
   void _updateBottleData(
     dynamic value,
   ) {
+    if (!isBottleConnected) {
+      if (mounted) {
+        setState(() {
+          hasBottleData = false;
+          currentBottleMl = 0;
+          bottleLevelPercent = 0;
+          lastUpdatedTimestamp = 0;
+        });
+      }
+      return;
+    }
+
     if (value is! Map) {
       debugPrint(
         'Device data is not Map',
@@ -523,19 +852,20 @@ class _HomePageState extends State<HomePage> {
             true;
       });
 
-      // =================================================
-      // ตรวจสอบค่าหลังจากอัปเดต
-      // =================================================
       debugPrint(
         'ระดับน้ำในขวด = $bottleLevelPercent%',
       );
 
       debugPrint(
-        '100 - $bottleLevelPercent = $graphPercent%',
+        'ดื่มแล้ววันนี้ = $consumedMl ML',
       );
 
       debugPrint(
-        'เปอร์เซ็นต์ใต้กราฟ = $graphPercent%',
+        'เหลืออีกวันนี้ = $remainingMl ML',
+      );
+
+      debugPrint(
+        'เปอร์เซ็นต์วันนี้ = $graphPercent%',
       );
 
       debugPrint(
@@ -545,37 +875,78 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =====================================================
-  // อ่าน volume_ml ล่าสุดจาก water_history
+  // อ่าน water_history เฉพาะ "วันนี้"
   //
-  // ใช้เป็นค่า "เหลืออีก"
+  // users/{uid}/water_history/YYYY-MM-DD
+  //
+  // เมื่อขึ้นวันใหม่ path จะเปลี่ยนเป็นวันใหม่
+  // ดื่มแล้ว / เหลืออีก / กราฟ จึงเริ่มใหม่
   // =====================================================
-  Future<void> listenLatestWaterHistory() async {
+    Future<void> listenLatestWaterHistory() async {
     try {
+      final user =
+          FirebaseAuth.instance.currentUser;
+
+      if (user == null) {
+        debugPrint(
+          'listenLatestWaterHistory: no logged-in user',
+        );
+
+        if (mounted) {
+          setState(() {
+            todayConsumedMl = 0;
+            hasHistoryVolumeData = false;
+          });
+        }
+
+        return;
+      }
+
+      final String uid =
+          user.uid;
+
+      final String todayKey =
+          _getTodayDateKey();
+
+      listeningHistoryDateKey =
+          todayKey;
+
       final database =
           getRealtimeDatabase();
 
+      // =================================================
+      // อ่านเฉพาะข้อมูลของ "วันนี้"
+      // =================================================
       final String historyPath =
-          'users/$bottleUserId/water_history';
+          'users/$uid/water_history/$todayKey';
 
       final DatabaseReference ref =
-          database.ref(historyPath);
+          database.ref(
+        historyPath,
+      );
 
       debugPrint('');
       debugPrint(
         '================================',
       );
-
       debugPrint(
-        'LISTENING WATER HISTORY',
+        'LISTENING TODAY WATER HISTORY',
       );
-
+      debugPrint(
+        'Logged-in UID: $uid',
+      );
+      debugPrint(
+        'Today: $todayKey',
+      );
       debugPrint(
         'History Path: $historyPath',
       );
-
       debugPrint(
         '================================',
       );
+
+      // ยกเลิก listener เดิมก่อน
+      await historySubscription?.cancel();
 
       // =================================================
       // อ่านครั้งแรก
@@ -585,24 +956,27 @@ class _HomePageState extends State<HomePage> {
             await ref.get();
 
         debugPrint(
-          'Initial Water History: ${snapshot.value}',
+          'Initial Today History: ${snapshot.value}',
         );
 
-        if (snapshot.exists) {
-          _updateLatestHistoryVolume(
+        if (snapshot.exists &&
+            snapshot.value != null) {
+          _updateTodayDrinkData(
             snapshot.value,
           );
+        } else {
+          _resetTodayDrinkData();
         }
       } catch (e) {
         debugPrint(
-          'Initial history read error: $e',
+          'Initial today history error: $e',
         );
+
+        _resetTodayDrinkData();
       }
 
-      await historySubscription?.cancel();
-
       // =================================================
-      // ฟังแบบ Realtime
+      // ฟังแบบ Realtime เฉพาะวันนี้
       // =================================================
       historySubscription =
           ref.onValue.listen(
@@ -611,41 +985,28 @@ class _HomePageState extends State<HomePage> {
               event.snapshot.value;
 
           debugPrint('');
-
           debugPrint(
-            'WATER HISTORY EVENT RECEIVED',
+            'TODAY WATER HISTORY EVENT',
           );
 
           if (value == null) {
             debugPrint(
-              'No water_history found',
+              'No history for today',
             );
 
-            if (mounted) {
-              setState(() {
-                hasHistoryVolumeData =
-                    false;
-              });
-            }
+            _resetTodayDrinkData();
 
             return;
           }
 
-          _updateLatestHistoryVolume(
+          _updateTodayDrinkData(
             value,
           );
         },
         onError: (Object error) {
           debugPrint(
-            'Water History Error: $error',
+            'Today Water History Error: $error',
           );
-
-          if (mounted) {
-            setState(() {
-              hasHistoryVolumeData =
-                  false;
-            });
-          }
         },
       );
     } catch (e) {
@@ -653,217 +1014,299 @@ class _HomePageState extends State<HomePage> {
         'listenLatestWaterHistory Error: $e',
       );
 
-      if (mounted) {
-        setState(() {
-          hasHistoryVolumeData =
-              false;
-        });
-      }
+      _resetTodayDrinkData();
     }
   }
 
   // =====================================================
-  // หา volume_ml ที่ใหม่ที่สุด
+  // RESET DAILY DATA
+  //
+  // วันนี้ยังไม่มีประวัติ
+  // ดื่มแล้ว = 0
+  // เหลืออีก = เป้าหมายเต็ม
+  // กราฟ = 0%
   // =====================================================
-  void _updateLatestHistoryVolume(
+  void _resetTodayDrinkData() {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      todayConsumedMl = 0;
+
+      // ให้ UI แสดง 0 ML ได้
+      // แทนที่จะขึ้น -- ML
+      hasHistoryVolumeData = true;
+    });
+
+    debugPrint('');
+    debugPrint(
+      '================================',
+    );
+    debugPrint(
+      'TODAY DRINK DATA RESET',
+    );
+    debugPrint(
+      'ดื่มแล้ว = 0 ML',
+    );
+    debugPrint(
+      'เหลืออีก = $dailyGoalMl ML',
+    );
+    debugPrint(
+      'กราฟ = 0%',
+    );
+    debugPrint(
+      '================================',
+    );
+  }
+
+  // =====================================================
+  // คำนวณการดื่มของ "วันนี้"
+  //
+  // หลักการ:
+  //
+  // 1500 -> 1400 = ดื่ม 100 ML
+  // 1400 -> 1200 = ดื่ม 200 ML
+  //
+  // รวม = 300 ML
+  //
+  // แต่ถ้า:
+  // 1200 -> 1800
+  //
+  // คือเติมน้ำ
+  // ไม่ถือว่าเป็นการดื่ม
+  // =====================================================
+  void _updateTodayDrinkData(
     dynamic value,
   ) {
     if (value is! Map) {
       debugPrint(
-        'water_history is not Map',
+        'Today water_history is not Map',
       );
+
+      _resetTodayDrinkData();
 
       return;
     }
 
-    final historyRoot =
+    final dayRecords =
         Map<Object?, Object?>.from(
       value,
     );
 
-    int latestVolume = 0;
-    int latestTimestamp = -1;
-
-    String latestDate = '';
-    String latestTime = '';
+    final List<_HomeWaterRecord> records =
+        [];
 
     // =================================================
-    // วนแต่ละวัน
+    // แปลง Firebase records เป็น List
     // =================================================
-    for (final dateEntry
-        in historyRoot.entries) {
-      final dateKey =
-          dateEntry.key.toString();
+    for (final entry
+        in dayRecords.entries) {
+      final String timeKey =
+          entry.key.toString();
 
-      final dateValue =
-          dateEntry.value;
+      final rawRecord =
+          entry.value;
 
-      if (dateValue is! Map) {
+      if (rawRecord is! Map) {
         continue;
       }
 
-      final dayRecords =
+      final record =
           Map<Object?, Object?>.from(
-        dateValue,
+        rawRecord,
+      );
+
+      if (!record.containsKey(
+        'volume_ml',
+      )) {
+        continue;
+      }
+
+      final int volume =
+          parseIntValue(
+        record['volume_ml'],
+      );
+
+      final int timestamp =
+          parseIntValue(
+        record['timestamp'],
+      );
+
+      if (volume < 0) {
+        continue;
+      }
+
+      records.add(
+        _HomeWaterRecord(
+          key: timeKey,
+          volumeMl: volume,
+          timestamp: timestamp,
+        ),
+      );
+    }
+
+    // =================================================
+    // วันนี้ยังไม่มีข้อมูล
+    // =================================================
+    if (records.isEmpty) {
+      _resetTodayDrinkData();
+
+      return;
+    }
+
+    // =================================================
+    // เรียงข้อมูลจากเก่า -> ใหม่
+    // =================================================
+    records.sort(
+      (
+        a,
+        b,
+      ) {
+        // ถ้ามี timestamp ทั้งคู่
+        if (a.timestamp > 0 &&
+            b.timestamp > 0) {
+          return a.timestamp.compareTo(
+            b.timestamp,
+          );
+        }
+
+        // ถ้าไม่มี timestamp
+        // ใช้ key เวลา HH-MM-SS
+        return a.key.compareTo(
+          b.key,
+        );
+      },
+    );
+
+    int totalConsumed = 0;
+
+    // record แรกเป็นค่าตั้งต้น
+    int previousVolume =
+        records.first.volumeMl;
+
+    debugPrint('');
+    debugPrint(
+      '================================',
+    );
+    debugPrint(
+      'CALCULATE TODAY DRINK',
+    );
+    debugPrint(
+      'Records: ${records.length}',
+    );
+    debugPrint(
+      'First volume: $previousVolume ML',
+    );
+
+    // =================================================
+    // เปรียบเทียบแต่ละ record
+    // =================================================
+    for (
+      int i = 1;
+      i < records.length;
+      i++
+    ) {
+      final int currentVolume =
+          records[i].volumeMl;
+
+      debugPrint(
+        '${records[i - 1].key}: $previousVolume ML'
+        ' -> '
+        '${records[i].key}: $currentVolume ML',
       );
 
       // =================================================
-      // วนแต่ละเวลา
+      // น้ำลด = ดื่มน้ำ
       // =================================================
-      for (final timeEntry
-          in dayRecords.entries) {
-        final timeKey =
-            timeEntry.key.toString();
+      if (previousVolume >
+          currentVolume) {
+        final int drank =
+            previousVolume -
+                currentVolume;
 
-        final rawRecord =
-            timeEntry.value;
+        totalConsumed +=
+            drank;
 
-        if (rawRecord is! Map) {
-          continue;
-        }
-
-        final record =
-            Map<Object?, Object?>.from(
-          rawRecord,
+        debugPrint(
+          'DRINK: +$drank ML',
         );
-
-        if (!record.containsKey(
-          'volume_ml',
-        )) {
-          continue;
-        }
-
-        final volume =
-            parseIntValue(
-          record['volume_ml'],
-        );
-
-        final timestamp =
-            parseIntValue(
-          record['timestamp'],
-        );
-
-        // รองรับ 0 ML
-        if (volume < 0) {
-          continue;
-        }
-
-        // =================================================
-        // ถ้ามี timestamp
-        // =================================================
-        if (timestamp > 0) {
-          if (timestamp >
-              latestTimestamp) {
-            latestTimestamp =
-                timestamp;
-
-            latestVolume =
-                volume;
-
-            latestDate =
-                dateKey;
-
-            latestTime =
-                timeKey;
-          }
-        }
-
-        // =================================================
-        // ถ้าไม่มี timestamp
-        // ใช้วัน + เวลาเปรียบเทียบ
-        // =================================================
-        else if (latestTimestamp <= 0) {
-          final currentKey =
-              '$dateKey/$timeKey';
-
-          final latestKey =
-              '$latestDate/$latestTime';
-
-          if (latestDate.isEmpty ||
-              currentKey.compareTo(
-                    latestKey,
-                  ) >
-                  0) {
-            latestVolume =
-                volume;
-
-            latestDate =
-                dateKey;
-
-            latestTime =
-                timeKey;
-          }
-        }
       }
+
+      // =================================================
+      // น้ำเพิ่ม = เติมน้ำ
+      // ไม่บวกเป็นการดื่ม
+      // =================================================
+      else if (currentVolume >
+          previousVolume) {
+        debugPrint(
+          'REFILL: not counted',
+        );
+      }
+
+      // =================================================
+      // น้ำเท่าเดิม
+      // =================================================
+      else {
+        debugPrint(
+          'UNCHANGED',
+        );
+      }
+
+      previousVolume =
+          currentVolume;
     }
+
+    // =================================================
+    // จำกัดไม่ให้เกินเป้าหมายรายวัน
+    // =================================================
+    totalConsumed =
+        totalConsumed.clamp(
+      0,
+      dailyGoalMl,
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      todayConsumedMl =
+          totalConsumed;
+
+      hasHistoryVolumeData =
+          true;
+    });
 
     debugPrint(
       '--------------------------------',
     );
-
     debugPrint(
-      'LATEST WATER HISTORY',
+      'TODAY DRINK SUMMARY',
     );
-
     debugPrint(
-      'Date: $latestDate',
+      'ดื่มแล้ววันนี้ = $todayConsumedMl ML',
     );
-
     debugPrint(
-      'Time: $latestTime',
+      'เป้าหมาย = $dailyGoalMl ML',
     );
-
     debugPrint(
-      'เหลืออีก: $latestVolume ML',
+      'เหลืออีก = $remainingMl ML',
     );
-
     debugPrint(
-      'timestamp: $latestTimestamp',
+      'เปอร์เซ็นต์ = $graphPercent%',
     );
-
     debugPrint(
-      '--------------------------------',
+      '================================',
     );
-
-    if (latestDate.isNotEmpty) {
-      if (mounted) {
-        setState(() {
-          latestHistoryVolumeMl =
-              latestVolume;
-
-          hasHistoryVolumeData =
-              true;
-        });
-
-        debugPrint(
-          'เป้าหมาย = $dailyGoalMl ML',
-        );
-
-        debugPrint(
-          'เหลืออีก = $latestHistoryVolumeMl ML',
-        );
-
-        debugPrint(
-          'ดื่มแล้ว = $consumedMl ML',
-        );
-
-        debugPrint(
-          'ระดับน้ำในขวด = $bottleLevelPercent%',
-        );
-
-        debugPrint(
-          'เปอร์เซ็นต์ใต้กราฟ = 100 - $bottleLevelPercent = $graphPercent%',
-        );
-      }
-    } else {
-      if (mounted) {
-        setState(() {
-          hasHistoryVolumeData =
-              false;
-        });
-      }
-    }
   }
+
+  // =====================================================
+  // MODEL สำหรับข้อมูล water_history ในหน้า Home
+  // =====================================================
+  // หมายเหตุ:
+  // class จริงจะใส่หลังปิด _HomePageState ในท่อนถัดไป
+  // =====================================================
 
   // =====================================================
   // คำนวณเป้าหมายรายวัน
@@ -963,6 +1406,8 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
+    // หลัง 21:00
+    // ให้รอ 07:00 ของวันถัดไป
     if (!found) {
       nextHour = 7;
     }
@@ -1000,15 +1445,20 @@ class _HomePageState extends State<HomePage> {
           FieldValue.serverTimestamp(),
     });
 
+    // เมื่อผู้ใช้แก้เป้าหมาย ให้ RTDB/ESP32 ได้ค่าใหม่ทันที
+    await syncDailyGoalToRealtimeDatabase(goalMl);
+
     if (mounted) {
       setState(() {
         dailyGoalMl =
             goalMl;
+
+        // หลังแก้เป้าหมาย
+        // ค่าเหลืออีกและ % จะคำนวณใหม่อัตโนมัติ
       });
     }
   }
-
-  // =====================================================
+    // =====================================================
   // DIALOG แก้เป้าหมาย
   // =====================================================
   void showEditGoalDialog() {
@@ -1069,7 +1519,6 @@ class _HomePageState extends State<HomePage> {
                             size: 34,
                           ),
                         ),
-
                         const Expanded(
                           child: Text(
                             'เป้าหมายการดื่มน้ำ',
@@ -1077,13 +1526,13 @@ class _HomePageState extends State<HomePage> {
                                 TextAlign.center,
                             style:
                                 TextStyle(
-                              fontSize: 28,
+                              fontSize:
+                                  28,
                               fontWeight:
                                   FontWeight.bold,
                             ),
                           ),
                         ),
-
                         const SizedBox(
                           width: 48,
                         ),
@@ -1095,8 +1544,6 @@ class _HomePageState extends State<HomePage> {
                     ),
 
                     Row(
-                      mainAxisAlignment:
-                          MainAxisAlignment.center,
                       children: [
                         GoalStepButton(
                           icon:
@@ -1115,23 +1562,31 @@ class _HomePageState extends State<HomePage> {
                         ),
 
                         const SizedBox(
-                          width: 24,
+                          width: 12,
                         ),
 
-                        Text(
-                          formatNumber(
-                            tempGoal,
-                          ),
-                          style:
-                              const TextStyle(
-                            fontSize: 44,
-                            fontWeight:
-                                FontWeight.bold,
+                        Expanded(
+                          child: FittedBox(
+                            fit:
+                                BoxFit.scaleDown,
+                            child: Text(
+                              formatNumber(
+                                tempGoal,
+                              ),
+                              maxLines: 1,
+                              style:
+                                  const TextStyle(
+                                fontSize:
+                                    44,
+                                fontWeight:
+                                    FontWeight.bold,
+                              ),
+                            ),
                           ),
                         ),
 
                         const SizedBox(
-                          width: 24,
+                          width: 12,
                         ),
 
                         GoalStepButton(
@@ -1206,7 +1661,8 @@ class _HomePageState extends State<HomePage> {
                           'เปลี่ยนเป้าหมาย',
                           style:
                               TextStyle(
-                            fontSize: 26,
+                            fontSize:
+                                26,
                             fontWeight:
                                 FontWeight.bold,
                           ),
@@ -1253,29 +1709,19 @@ class _HomePageState extends State<HomePage> {
         screenHeight < 720;
 
     // =====================================================
-    // ดื่มแล้ว ML
-    //
-    // เป้าหมาย - เหลืออีก
+    // ดื่มแล้วของวันนี้
     // =====================================================
     final int drankMl =
         consumedMl;
 
     // =====================================================
-    // เปอร์เซ็นต์ใต้กราฟ
-    //
-    // 100 - ระดับน้ำในขวด
-    //
-    // เช่น:
-    // ระดับน้ำ 53%
-    // ใต้กราฟ 47%
+    // เปอร์เซ็นต์ของวันนี้
     // =====================================================
     final int displayedGraphPercent =
         graphPercent;
 
     // =====================================================
-    // กราฟวงกลม
-    //
-    // ใช้ค่าเดียวกับเปอร์เซ็นต์ใต้กราฟ
+    // Progress ของกราฟวงกลมวันนี้
     // =====================================================
     final double safeProgress =
         graphProgress;
@@ -1377,27 +1823,31 @@ class _HomePageState extends State<HomePage> {
                             dailyGoalMl:
                                 dailyGoalMl,
 
-                            // เหลืออีก ML
+                            // เหลืออีกของวันนี้
                             remainingMl:
-                                latestHistoryVolumeMl,
+                                remainingMl,
 
-                            // ดื่มแล้ว ML
+                            // ดื่มแล้วของวันนี้
                             consumedMl:
                                 drankMl,
 
-                            // กราฟ = 100 - ระดับน้ำ
+                            // กราฟของวันนี้
                             progress:
                                 safeProgress,
 
-                            // ใต้กราฟ = 100 - ระดับน้ำ
+                            // เปอร์เซ็นต์ของวันนี้
                             percent:
                                 displayedGraphPercent,
 
+                            // วันนี้ไม่มีข้อมูล
+                            // ก็ยังแสดง 0 ML ได้
                             hasVolumeData:
-                                hasHistoryVolumeData,
+                                true,
 
+                            // ระดับน้ำในขวดยังใช้ข้อมูลจริงจาก ESP32
                             hasBottleData:
-                                hasBottleData,
+                                isBottleConnected &&
+                                    hasBottleData,
 
                             isLoading:
                                 isLoading,
@@ -1438,7 +1888,7 @@ class _HomePageState extends State<HomePage> {
                                   bottomIcon:
                                       Icons.access_time,
                                   bottomText:
-                                      'ปริมาณน้ำที่ควรดื่ม 150 ml',
+                                      'ปริมาณน้ำที่ควรดื่ม ${formatNumber(twoHourDrinkTargetMl)} ml / 2 ชม.',
                                   scale:
                                       scale,
                                   compact:
@@ -1461,19 +1911,19 @@ class _HomePageState extends State<HomePage> {
                                   title:
                                       'ระดับน้ำในขวด',
 
-                                  // =========================
-                                  // แสดงระดับน้ำจริงจากขวด
-                                  // เช่น 53%
-                                  // =========================
+                                  // ระดับน้ำจริงจากขวด
                                   value:
-                                      hasBottleData
+                                      isBottleConnected &&
+                                              hasBottleData
                                           ? '$bottleLevelPercent%'
-                                          : '--%',
+                                          : '0%',
 
                                   bottomText:
-                                      hasBottleData
-                                          ? 'ข้อมูลล่าสุดจากขวด'
-                                          : 'กำลังรอข้อมูลจากขวด',
+                                      !isBottleConnected
+                                          ? 'ยังไม่ได้เชื่อมต่อกับขวด'
+                                          : hasBottleData
+                                              ? 'ข้อมูลล่าสุดจากขวด'
+                                              : 'กำลังรอข้อมูลจากขวด',
 
                                   scale:
                                       scale,
@@ -1522,6 +1972,21 @@ class _HomePageState extends State<HomePage> {
       ),
     );
   }
+}
+
+// =====================================================
+// MODEL สำหรับ water_history ของหน้า Home
+// =====================================================
+class _HomeWaterRecord {
+  const _HomeWaterRecord({
+    required this.key,
+    required this.volumeMl,
+    required this.timestamp,
+  });
+
+  final String key;
+  final int volumeMl;
+  final int timestamp;
 }
 
 // =====================================================
@@ -1640,24 +2105,6 @@ class HeaderSection extends StatelessWidget {
                     ),
                   ),
 
-                  Positioned(
-                    right: 2,
-                    top: 0,
-                    child:
-                        Container(
-                      width:
-                          9 * scale,
-                      height:
-                          9 * scale,
-                      decoration:
-                          const BoxDecoration(
-                        color:
-                            Colors.red,
-                        shape:
-                            BoxShape.circle,
-                      ),
-                    ),
-                  ),
                 ],
               ),
             ),
@@ -1706,7 +2153,6 @@ class HeaderSection extends StatelessWidget {
     );
   }
 }
-
 // =====================================================
 // GOAL CARD
 // =====================================================
@@ -1728,16 +2174,16 @@ class GoalCard extends StatelessWidget {
 
   final int dailyGoalMl;
 
-  // เหลืออีก
+  // เหลืออีกวันนี้
   final int remainingMl;
 
-  // ดื่มแล้ว
+  // ดื่มแล้ววันนี้
   final int consumedMl;
 
-  // กราฟ 100 - ระดับน้ำ
+  // progress ของกราฟวงกลม 0.0 - 1.0
   final double progress;
 
-  // % 100 - ระดับน้ำ
+  // เปอร์เซ็นต์ที่ดื่มแล้ววันนี้
   final int percent;
 
   final bool hasVolumeData;
@@ -1942,19 +2388,19 @@ class EditGoalButton extends StatelessWidget {
 // =====================================================
 // PROGRESS CIRCLE
 //
-// ดื่มแล้ว ML:
-// เป้าหมาย - เหลืออีก
+// ตอนนี้กราฟใช้ข้อมูล "เฉพาะวันนี้"
 //
-// % ใต้กราฟ:
-// 100 - bottle_level_percent
-//
-// เส้นวงกลม:
-// 100 - bottle_level_percent
+// สูตร:
+// ดื่มแล้ววันนี้ / เป้าหมายวันนี้
 //
 // ตัวอย่าง:
-// น้ำในขวด 53%
-// ใต้กราฟ 47%
-// เส้นกราฟ 47%
+// เป้าหมาย 1300 ML
+// ดื่มแล้ว 650 ML
+// = 50%
+//
+// เมื่อขึ้นวันใหม่:
+// ดื่มแล้ว = 0 ML
+// กราฟ = 0%
 // =====================================================
 class GoalProgressCircle extends StatelessWidget {
   const GoalProgressCircle({
@@ -1970,11 +2416,10 @@ class GoalProgressCircle extends StatelessWidget {
 
   final double progress;
 
-  // เปอร์เซ็นต์ดื่มแล้ว
-  // 100 - ระดับน้ำในขวด
+  // เปอร์เซ็นต์ที่ดื่มแล้ววันนี้
   final int percent;
 
-  // ML ที่ดื่มแล้ว
+  // ML ที่ดื่มแล้ววันนี้
   final int consumedMl;
 
   final bool hasVolumeData;
@@ -2044,9 +2489,8 @@ class GoalProgressCircle extends StatelessWidget {
                           BoxFit.scaleDown,
                       child:
                           Text(
-                        hasVolumeData
-                            ? '${formatNumber(consumedMl)} ML'
-                            : '-- ML',
+                        // วันใหม่ก็แสดง 0 ML ได้เลย
+                        '${formatNumber(consumedMl)} ML',
                         style:
                             TextStyle(
                           fontSize:
@@ -2073,18 +2517,13 @@ class GoalProgressCircle extends StatelessWidget {
         ),
 
         // =================================================
-        // เปอร์เซ็นต์ใต้กราฟ
+        // เปอร์เซ็นต์วันนี้
         //
-        // 100 - ระดับน้ำในขวด
-        //
-        // เช่น:
-        // ระดับน้ำ = 53%
-        // ตรงนี้ = 47%
+        // ไม่ใช้ bottleLevelPercent แล้ว
+        // วันใหม่จะเป็น 0%
         // =================================================
         Text(
-          hasBottleData
-              ? '$percent%'
-              : '--%',
+          '$percent%',
           style:
               TextStyle(
             fontSize:
@@ -2118,7 +2557,7 @@ class GoalDetail extends StatelessWidget {
 
   final int dailyGoalMl;
 
-  // เหลืออีก
+  // เหลืออีกของวันนี้
   final int remainingMl;
 
   final bool hasVolumeData;
@@ -2211,9 +2650,8 @@ class GoalDetail extends StatelessWidget {
               Alignment.centerLeft,
           child:
               Text(
-            hasVolumeData
-                ? '${formatNumber(remainingMl)} ML'
-                : '-- ML',
+            // วันใหม่จะเท่ากับเป้าหมายเต็ม
+            '${formatNumber(remainingMl)} ML',
             style:
                 TextStyle(
               fontSize:
@@ -2242,7 +2680,6 @@ class GoalDetail extends StatelessWidget {
     );
   }
 }
-
 // =====================================================
 // SUMMARY CARD
 // =====================================================
@@ -2252,180 +2689,130 @@ class SummaryCard extends StatelessWidget {
     required this.icon,
     required this.title,
     required this.value,
+    this.bottomIcon,
     required this.bottomText,
     required this.scale,
     required this.compact,
-    this.bottomIcon,
   });
 
   final IconData icon;
-
   final String title;
   final String value;
+
+  final IconData? bottomIcon;
   final String bottomText;
 
   final double scale;
   final bool compact;
 
-  final IconData? bottomIcon;
-
   @override
-  Widget build(
-    BuildContext context,
-  ) {
+  Widget build(BuildContext context) {
     return Container(
-      height:
-          (compact
-                  ? 166
-                  : 180) *
-              scale,
-      padding:
-          EdgeInsets.symmetric(
-        horizontal:
-            10 * scale,
-        vertical:
-            12 * scale,
+      height: (compact ? 160 : 176) * scale,
+      padding: EdgeInsets.all(
+        16 * scale,
       ),
-      decoration:
-          BoxDecoration(
-        color:
-            Colors.white,
-        borderRadius:
-            BorderRadius.circular(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(
           22 * scale,
         ),
         boxShadow: [
           BoxShadow(
-            color:
-                Colors.black.withOpacity(
-              0.13,
+            color: Colors.black.withOpacity(
+              0.12,
             ),
-            blurRadius:
-                14,
-            offset:
-                const Offset(
+            blurRadius: 14,
+            offset: const Offset(
               0,
               7,
             ),
           ),
         ],
       ),
-      child:
-          Column(
-        mainAxisAlignment:
-            MainAxisAlignment.center,
+      child: Column(
+        crossAxisAlignment:
+            CrossAxisAlignment.start,
         children: [
-          CircleAvatar(
-            radius:
-                26 * scale,
-            backgroundColor:
-                const Color(
-              0xFFB7DCFF,
-            ),
-            child:
-                Icon(
-              icon,
-              size:
-                  27 * scale,
-              color:
-                  const Color(
-                0xFF2378C9,
-              ),
-            ),
-          ),
-
-          SizedBox(
-            height:
-                9 * scale,
-          ),
-
-          Text(
-            title,
-            textAlign:
-                TextAlign.center,
-            maxLines:
-                2,
-            overflow:
-                TextOverflow.ellipsis,
-            style:
-                TextStyle(
-              fontSize:
-                  12.5 * scale,
-              color:
-                  Colors.black,
-            ),
-          ),
-
-          SizedBox(
-            height:
-                6 * scale,
-          ),
-
-          FittedBox(
-            fit:
-                BoxFit.scaleDown,
-            child:
-                Text(
-              value,
-              maxLines:
-                  1,
-              style:
-                  TextStyle(
-                fontSize:
-                    24 * scale,
-                fontWeight:
-                    FontWeight.bold,
-                color:
-                    const Color(
+          Row(
+            children: [
+              Icon(
+                icon,
+                size: 26 * scale,
+                color: const Color(
                   0xFF2378C9,
                 ),
               ),
-            ),
+              SizedBox(
+                width: 8 * scale,
+              ),
+              Expanded(
+                child: Text(
+                  title,
+                  maxLines: 2,
+                  overflow:
+                      TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 15 * scale,
+                    fontWeight:
+                        FontWeight.bold,
+                    color: const Color(
+                      0xFF16324F,
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
 
-          SizedBox(
-            height:
-                5 * scale,
-          ),
+          const Spacer(),
 
-          Row(
-            mainAxisAlignment:
-                MainAxisAlignment.center,
-            children: [
-              if (bottomIcon !=
-                  null) ...[
-                Icon(
-                  bottomIcon,
-                  size:
-                      12 * scale,
-                  color:
-                      const Color(
+          Center(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                value,
+                style: TextStyle(
+                  fontSize: 27 * scale,
+                  fontWeight:
+                      FontWeight.bold,
+                  color: const Color(
                     0xFF2378C9,
                   ),
                 ),
+              ),
+            ),
+          ),
 
+          const Spacer(),
+
+          Row(
+            crossAxisAlignment:
+                CrossAxisAlignment.start,
+            children: [
+              if (bottomIcon != null) ...[
+                Icon(
+                  bottomIcon,
+                  size: 16 * scale,
+                  color:
+                      Colors.grey.shade600,
+                ),
                 SizedBox(
-                  width:
-                      3 * scale,
+                  width: 5 * scale,
                 ),
               ],
 
-              Flexible(
-                child:
-                    Text(
+              Expanded(
+                child: Text(
                   bottomText,
-                  textAlign:
-                      TextAlign.center,
-                  maxLines:
-                      2,
+                  maxLines: 2,
                   overflow:
                       TextOverflow.ellipsis,
-                  style:
-                      TextStyle(
-                    fontSize:
-                        9.5 * scale,
+                  style: TextStyle(
+                    fontSize: 11.5 * scale,
+                    height: 1.25,
                     color:
-                        Colors.black,
+                        Colors.grey.shade600,
                   ),
                 ),
               ),
@@ -2438,7 +2825,7 @@ class SummaryCard extends StatelessWidget {
 }
 
 // =====================================================
-// BOTTOM NAVIGATION
+// BOTTOM NAVIGATION BAR
 // =====================================================
 class BottomNavBar extends StatelessWidget {
   const BottomNavBar({
@@ -2449,158 +2836,217 @@ class BottomNavBar extends StatelessWidget {
   final double scale;
 
   @override
-  Widget build(
-    BuildContext context,
-  ) {
+  Widget build(BuildContext context) {
     return Container(
-      height:
-          70 * scale,
-      decoration:
-          BoxDecoration(
-        color:
-            Colors.white,
-        borderRadius:
-            BorderRadius.circular(
-          36 * scale,
+      height: 70 * scale,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(
+          40 * scale,
         ),
         boxShadow: [
           BoxShadow(
-            color:
-                Colors.black.withOpacity(
-              0.14,
+            color: Colors.black.withOpacity(
+              0.16,
             ),
-            blurRadius:
-                16,
-            offset:
-                const Offset(
+            blurRadius: 16,
+            offset: const Offset(
               0,
-              7,
+              8,
             ),
           ),
         ],
       ),
-      child:
-          Row(
-        mainAxisAlignment:
-            MainAxisAlignment.spaceEvenly,
+      child: Row(
         children: [
-          BottomNavItem(
-            icon:
-                Icons.home,
-            label:
-                'หน้าแรก',
-            active:
-                true,
-            scale:
-                scale,
-            onTap:
-                () {},
-          ),
-
-          BottomNavItem(
-            icon:
-                Icons.bar_chart,
-            label:
-                'สถิติ',
-            active:
-                false,
-            scale:
-                scale,
-            onTap: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder:
-                      (_) =>
-                          const StatisticsPage(),
+          // =================================================
+          // HOME
+          // =================================================
+          Expanded(
+            child: Column(
+              mainAxisAlignment:
+                  MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.home,
+                  size: 31 * scale,
+                  color: const Color(
+                    0xFF2378C9,
+                  ),
                 ),
-              );
-            },
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// =====================================================
-// BOTTOM NAV ITEM
-// =====================================================
-class BottomNavItem extends StatelessWidget {
-  const BottomNavItem({
-    super.key,
-    required this.icon,
-    required this.label,
-    required this.active,
-    required this.scale,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String label;
-
-  final bool active;
-
-  final double scale;
-
-  final VoidCallback onTap;
-
-  @override
-  Widget build(
-    BuildContext context,
-  ) {
-    final color =
-        active
-            ? const Color(
-                0xFF2378C9,
-              )
-            : Colors.grey;
-
-    return InkWell(
-      onTap:
-          onTap,
-      borderRadius:
-          BorderRadius.circular(
-        28,
-      ),
-      child:
-          SizedBox(
-        width:
-            82 * scale,
-        child:
-            Column(
-          mainAxisAlignment:
-              MainAxisAlignment.center,
-          children: [
-            Icon(
-              icon,
-              size:
-                  30 * scale,
-              color:
-                  color,
+                Text(
+                  'หน้าแรก',
+                  style: TextStyle(
+                    fontSize: 12 * scale,
+                    fontWeight:
+                        FontWeight.bold,
+                    color: const Color(
+                      0xFF2378C9,
+                    ),
+                  ),
+                ),
+              ],
             ),
+          ),
 
-            Text(
-              label,
-              style:
-                  TextStyle(
-                fontSize:
-                    13 * scale,
-                fontWeight:
-                    FontWeight.bold,
-                color:
-                    color,
+          // =================================================
+          // STATISTICS
+          // =================================================
+          Expanded(
+            child: InkWell(
+              borderRadius:
+                  BorderRadius.circular(
+                40 * scale,
+              ),
+              onTap: () {
+                Navigator.pushReplacement(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) =>
+                        const StatisticsPage(),
+                  ),
+                );
+              },
+              child: Column(
+                mainAxisAlignment:
+                    MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    Icons.bar_chart,
+                    size: 31 * scale,
+                    color:
+                        Colors.grey.shade500,
+                  ),
+                  Text(
+                    'สถิติ',
+                    style: TextStyle(
+                      fontSize: 12 * scale,
+                      fontWeight:
+                          FontWeight.bold,
+                      color:
+                          Colors.grey.shade500,
+                    ),
+                  ),
+                ],
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
 }
 
 // =====================================================
-// GOAL STEP BUTTON
+// PROGRESS CIRCLE PAINTER
+//
+// progress:
+// 0.0 = 0%
+// 0.5 = 50%
+// 1.0 = 100%
+//
+// เมื่อขึ้นวันใหม่ progress = 0.0
+// กราฟจะกลับไปเริ่มต้นใหม่
+// =====================================================
+class ProgressCirclePainter
+    extends CustomPainter {
+  ProgressCirclePainter({
+    required this.progress,
+  });
+
+  final double progress;
+
+  @override
+  void paint(
+    Canvas canvas,
+    Size size,
+  ) {
+    final center = Offset(
+      size.width / 2,
+      size.height / 2,
+    );
+
+    final radius =
+        math.min(
+          size.width,
+          size.height,
+        ) /
+            2 -
+        10;
+
+    // =================================================
+    // วงพื้นหลัง
+    // =================================================
+    final backgroundPaint = Paint()
+      ..color = const Color(
+        0xFFDDEEFF,
+      )
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 13
+      ..strokeCap = StrokeCap.round;
+
+    canvas.drawCircle(
+      center,
+      radius,
+      backgroundPaint,
+    );
+
+    // =================================================
+    // วง Progress
+    // =================================================
+    final progressPaint = Paint()
+      ..color = const Color(
+        0xFF3D9ADC,
+      )
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 13
+      ..strokeCap = StrokeCap.round;
+
+    final safeProgress =
+        progress.clamp(
+      0.0,
+      1.0,
+    );
+
+    final sweepAngle =
+        2 *
+        math.pi *
+        safeProgress;
+
+    // เริ่มจากด้านบน
+    const startAngle =
+        -math.pi / 2;
+
+    final rect =
+        Rect.fromCircle(
+      center: center,
+      radius: radius,
+    );
+
+    // ถ้าเป็น 0%
+    // ไม่ต้องวาดส่วน Progress
+    if (safeProgress > 0) {
+      canvas.drawArc(
+        rect,
+        startAngle,
+        sweepAngle,
+        false,
+        progressPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(
+    covariant ProgressCirclePainter oldDelegate,
+  ) {
+    return oldDelegate.progress !=
+        progress;
+  }
+}
+
+// =====================================================
+// ปุ่ม + / - ใน Dialog เป้าหมาย
 // =====================================================
 class GoalStepButton extends StatelessWidget {
   const GoalStepButton({
@@ -2616,131 +3062,66 @@ class GoalStepButton extends StatelessWidget {
   Widget build(
     BuildContext context,
   ) {
-    return CircleAvatar(
-      radius:
-          28,
-      backgroundColor:
-          const Color(
-        0xFF2378C9,
+    return InkWell(
+      onTap: onTap,
+      borderRadius:
+          BorderRadius.circular(
+        100,
       ),
-      child:
-          IconButton(
-        onPressed:
-            onTap,
-        icon:
-            Icon(
+      child: Container(
+        width: 54,
+        height: 54,
+        decoration:
+            const BoxDecoration(
+          color: Color(
+            0xFFD8ECFF,
+          ),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(
           icon,
-          color:
-              Colors.white,
-          size:
-              34,
+          size: 32,
+          color: const Color(
+            0xFF2378C9,
+          ),
         ),
       ),
     );
-  }
-}
-
-// =====================================================
-// PROGRESS CIRCLE PAINTER
-// =====================================================
-class ProgressCirclePainter extends CustomPainter {
-  ProgressCirclePainter({
-    required this.progress,
-  });
-
-  final double progress;
-
-  @override
-  void paint(
-    Canvas canvas,
-    Size size,
-  ) {
-    const strokeWidth =
-        14.0;
-
-    final center =
-        Offset(
-      size.width / 2,
-      size.height / 2,
-    );
-
-    final radius =
-        (size.width -
-                strokeWidth) /
-            2;
-
-    final backgroundPaint =
-        Paint()
-          ..color =
-              const Color(
-            0xFFB7DCFF,
-          )
-          ..style =
-              PaintingStyle.stroke
-          ..strokeWidth =
-              strokeWidth
-          ..strokeCap =
-              StrokeCap.round;
-
-    final progressPaint =
-        Paint()
-          ..color =
-              const Color(
-            0xFF4A7DF3,
-          )
-          ..style =
-              PaintingStyle.stroke
-          ..strokeWidth =
-              strokeWidth
-          ..strokeCap =
-              StrokeCap.round;
-
-    canvas.drawCircle(
-      center,
-      radius,
-      backgroundPaint,
-    );
-
-    if (progress > 0) {
-      canvas.drawArc(
-        Rect.fromCircle(
-          center:
-              center,
-          radius:
-              radius,
-        ),
-        -math.pi / 2,
-        2 *
-            math.pi *
-            progress,
-        false,
-        progressPaint,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(
-    covariant ProgressCirclePainter
-        oldDelegate,
-  ) {
-    return oldDelegate.progress !=
-        progress;
   }
 }
 
 // =====================================================
 // FORMAT NUMBER
+//
+// 1200 -> 1,200
+// 1500 -> 1,500
 // =====================================================
 String formatNumber(
   int number,
 ) {
-  return number
-      .toString()
-      .replaceAllMapped(
-        RegExp(
-          r'\B(?=(\d{3})+(?!\d))',
-        ),
-        (match) => ',',
-      );
+  final text =
+      number.toString();
+
+  final buffer =
+      StringBuffer();
+
+  for (
+    int i = 0;
+    i < text.length;
+    i++
+  ) {
+    final position =
+        text.length - i;
+
+    buffer.write(
+      text[i],
+    );
+
+    if (position > 1 &&
+        position % 3 == 1) {
+      buffer.write(',');
+    }
+  }
+
+  return buffer.toString();
 }
