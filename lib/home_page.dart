@@ -180,6 +180,7 @@ class _HomePageState extends State<HomePage> {
     bottleSubscription?.cancel();
     pairingSubscription?.cancel();
     historySubscription?.cancel();
+    healthProfileSubscription?.cancel();
 
     super.dispose();
   }
@@ -450,6 +451,15 @@ class _HomePageState extends State<HomePage> {
         .doc(user.uid)
         .snapshots()
         .listen((doc) async {
+      // ถ้าบัญชีถูก logout/เปลี่ยนระหว่างที่ listener กำลังทำงาน
+      // ให้หยุด callback ทันที ไม่อ่าน/เขียนข้อมูลของ UID เดิมต่อ
+      final currentAuthUser = FirebaseAuth.instance.currentUser;
+      if (!mounted ||
+          currentAuthUser == null ||
+          currentAuthUser.uid != user.uid) {
+        return;
+      }
+
       if (!doc.exists) return;
 
       final data = doc.data();
@@ -476,6 +486,15 @@ class _HomePageState extends State<HomePage> {
         kidneyStage: kidneyStage,
       );
 
+      // ระหว่าง callback อาจมีการกดออกจากระบบได้
+      // ตรวจ UID อีกครั้งก่อนเขียน Firestore
+      final authBeforeUpdate = FirebaseAuth.instance.currentUser;
+      if (!mounted ||
+          authBeforeUpdate == null ||
+          authBeforeUpdate.uid != user.uid) {
+        return;
+      }
+
       // ข้อมูลสุขภาพเปลี่ยน = ยกเลิกเป้าหมายที่เคยตั้งเอง
       // เพื่อให้ระบบใช้ค่าที่คำนวณจากสุขภาพล่าสุด
       await FirebaseFirestore.instance
@@ -497,6 +516,10 @@ class _HomePageState extends State<HomePage> {
       debugPrint(
         'Health profile changed -> recalculated daily goal: $calculatedGoal ML/day',
       );
+    }, onError: (Object error) {
+      // ระหว่าง logout listener อาจได้รับ permission-denied ก่อนถูก dispose
+      // จึงรับ error ไว้และไม่ปล่อยให้กระทบ UI
+      debugPrint('Health profile listener stopped/error: $error');
     });
   }
 

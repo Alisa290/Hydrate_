@@ -27,6 +27,8 @@ class _NotificationPageState extends State<NotificationPage> {
   //
   // อ่านค่าจาก users/{uid}/drink_settings/two_hour_target_ml
   // เพื่อให้ตรงกับหน้าหลัก
+
+  
   // ============================================================
 
   int drinkAmountMl = 150; // fallback กรณียังอ่าน Firebase ไม่ได้

@@ -41,6 +41,7 @@ class _ProfilePageState extends State<ProfilePage>
 
   Timer? _dailyDisconnectTimer;
   bool _isAutoDisconnecting = false;
+  bool _isLoggingOut = false;
 
   bool _isAfterDailyCutoff([DateTime? now]) {
     final current = now ?? DateTime.now();
@@ -100,7 +101,7 @@ class _ProfilePageState extends State<ProfilePage>
   // ผู้ใช้ต้องกด "เชื่อมต่อขวดน้ำ" ใหม่เอง
   // =====================================================
   Future<void> _enforceDailyBottleDisconnect() async {
-    if (_isAutoDisconnecting) {
+    if (_isLoggingOut || _isAutoDisconnecting) {
       return;
     }
 
@@ -761,17 +762,74 @@ class _ProfilePageState extends State<ProfilePage>
   // LOGOUT
   // =====================================================
   Future<void> logout() async {
-    await FirebaseAuth.instance.signOut();
+    if (_isLoggingOut) return;
 
-    if (!mounted) return;
+    _isLoggingOut = true;
+    _dailyDisconnectTimer?.cancel();
 
-    Navigator.pushAndRemoveUntil(
-      context,
-      MaterialPageRoute(
-        builder: (context) => const LoginPage(),
-      ),
-      (route) => false,
-    );
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      final uid = user?.uid;
+
+      // ตัดการเชื่อมขวด แต่ไม่ยอมให้ Firebase/WiFi ค้างหน้าแอป
+      if (uid != null) {
+        try {
+          final ref = realtimeDatabase.ref(
+            'devices/$bottleDeviceId/active_user_id',
+          );
+
+          final snapshot = await ref
+              .get()
+              .timeout(const Duration(seconds: 2));
+
+          final activeUid =
+              snapshot.exists && snapshot.value != null
+                  ? snapshot.value.toString().trim()
+                  : '';
+
+          if (activeUid == uid) {
+            await ref
+                .remove()
+                .timeout(const Duration(seconds: 2));
+          }
+        } on TimeoutException catch (error) {
+          debugPrint('Logout disconnect timeout: $error');
+        } catch (error) {
+          debugPrint('Logout disconnect error: $error');
+        }
+      }
+
+      if (!mounted) return;
+
+      // สำคัญ:
+      // เอา Home/Profile ออกจาก route ก่อน เพื่อให้ dispose()
+      // ยกเลิก Timer และ Firebase listeners ของ UID เดิมให้หมด
+      // แล้วจึง signOut ป้องกัน listener เดิมยิง Firestore หลัง Auth หาย
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(
+          builder: (_) => const LoginPage(),
+        ),
+        (route) => false,
+      );
+
+      // รอให้ Flutter dispose route เก่าในเฟรมนี้ก่อน
+      await WidgetsBinding.instance.endOfFrame;
+
+      try {
+        await FirebaseAuth.instance
+            .signOut()
+            .timeout(const Duration(seconds: 3));
+      } on TimeoutException catch (error) {
+        debugPrint('Firebase signOut timeout: $error');
+      } catch (error) {
+        debugPrint('Firebase signOut error: $error');
+      }
+    } catch (error, stackTrace) {
+      debugPrint('logout error: $error');
+      debugPrint('$stackTrace');
+    } finally {
+      _isLoggingOut = false;
+    }
   }
 
   // =====================================================
@@ -863,6 +921,13 @@ class _ProfilePageState extends State<ProfilePage>
                             Navigator.pop(
                               dialogContext,
                             );
+
+                            // ให้ dialog ปิดก่อนเริ่ม Firebase request
+                            await Future<void>.delayed(
+                              const Duration(milliseconds: 50),
+                            );
+
+                            if (!mounted) return;
 
                             await logout();
                           },
