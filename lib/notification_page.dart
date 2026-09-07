@@ -32,20 +32,6 @@ class _NotificationPageState extends State<NotificationPage> {
   int drinkAmountMl = 150; // fallback กรณียังอ่าน Firebase ไม่ได้
 
   // ============================================================
-  // เงื่อนไขแจ้งเตือนดื่มน้ำมากเกิน
-  //
-  // มากกว่า 150 ml ภายใน 2 ชั่วโมง
-  // ============================================================
-
-  static const int overDrinkLimitMl = 150;
-
-  static const Duration overDrinkWindow = Duration(hours: 2);
-
-  // หลังแจ้งเตือนแล้ว
-  // จะไม่แจ้งซ้ำอีกภายใน 2 ชั่วโมง
-  static const Duration overDrinkCooldown = Duration(hours: 2);
-
-  // ============================================================
   // Firebase
   // ============================================================
 
@@ -90,7 +76,14 @@ class _NotificationPageState extends State<NotificationPage> {
   // true เมื่อ bottle_001 เชื่อมกับ UID ของผู้ใช้ปัจจุบัน
   bool isBottleConnected = false;
 
-  bool _isCheckingOverDrink = false;
+  bool _isCheckingHydrationStatus = false;
+
+  // คลาดเคลื่อนได้ ±10 mL ให้ตรงกับ ESP32
+  static const double drinkToleranceMl = 10.0;
+
+  // จำสถานะล่าสุดของแต่ละรอบ 2 ชั่วโมง ป้องกันการแจ้งซ้ำ
+  String _lastHydrationWindowKey = '';
+  String _lastHydrationStatus = '';
 
   String lastCheckedDateKey = '';
 
@@ -136,7 +129,7 @@ class _NotificationPageState extends State<NotificationPage> {
 
       await _createReachedNotifications();
 
-      await _checkOverDrinkAlert();
+      await _checkHydrationStatus();
     });
   }
 
@@ -400,7 +393,7 @@ class _NotificationPageState extends State<NotificationPage> {
     await _createReachedNotifications();
 
     // เช็กดื่มเกินทันที
-    await _checkOverDrinkAlert();
+    await _checkHydrationStatus();
 
     // ฟัง water_history
     _listenTodayWaterHistory();
@@ -598,7 +591,7 @@ class _NotificationPageState extends State<NotificationPage> {
 
         await _scheduleFutureDrinkReminders();
         await _createReachedNotifications();
-        await _checkOverDrinkAlert();
+        await _checkHydrationStatus();
         _listenTodayWaterHistory();
         await _listenNotifications();
       },
@@ -745,7 +738,7 @@ class _NotificationPageState extends State<NotificationPage> {
 
       await _createReachedNotifications();
 
-      await _checkOverDrinkAlert();
+      await _checkHydrationStatus();
     }
   }
 
@@ -836,7 +829,9 @@ class _NotificationPageState extends State<NotificationPage> {
   // ฟัง water_history ของวันนี้
   //
   // เมื่อ ESP32 บันทึกข้อมูลใหม่
-  // จะเช็ก Over Drink ทันที
+  // จะประเมินสถานะการดื่มทันที
+  // - ครบ/เกินเป้าหมาย: แจ้งทันที
+  // - ดื่มน้อย: แจ้งเฉพาะจุดตรวจทุก 30 นาที
   // ============================================================
 
   void _listenTodayWaterHistory() {
@@ -864,7 +859,7 @@ class _NotificationPageState extends State<NotificationPage> {
 
     historySubscription = ref.onValue.listen(
       (_) {
-        _checkOverDrinkAlert();
+        _checkHydrationStatus();
       },
       onError: (Object error) {
         debugPrint('Water history listener error: $error');
@@ -877,211 +872,231 @@ class _NotificationPageState extends State<NotificationPage> {
   // ดื่มน้ำมากกว่า 150 ml หรือไม่
   // ============================================================
 
-  Future<void> _checkOverDrinkAlert() async {
-    // ยังไม่เชื่อมขวด = ไม่ตรวจดื่มเกิน
-    if (!isBottleConnected) {
+  Future<void> _checkHydrationStatus() async {
+    if (!isBottleConnected || _isCheckingHydrationStatus) {
       return;
     }
 
-    if (_isCheckingOverDrink) {
-      return;
-    }
-
-    _isCheckingOverDrink = true;
+    _isCheckingHydrationStatus = true;
 
     try {
       final uid = currentUserId;
-
-      if (uid == null) {
+      if (uid == null || drinkAmountMl <= 0) {
         return;
       }
 
       final now = DateTime.now();
 
-      final windowStart = now.subtract(overDrinkWindow);
+      // ระบบ Hydrate Smart ใช้รอบ 2 ชั่วโมง:
+      // 07-09, 09-11, 11-13, 13-15, 15-17, 17-19, 19-21
+      int? windowStartHour;
+      for (final hour in drinkHours) {
+        final start = DateTime(now.year, now.month, now.day, hour);
+        final finish = start.add(const Duration(hours: 2));
 
-      // --------------------------------------------------------
-      // อ่านประวัติของวันที่เกี่ยวข้อง
-      //
-      // ถ้าช่วง 2 ชั่วโมงข้ามเที่ยงคืน
-      // จะอ่านทั้งเมื่อวาน + วันนี้
-      // --------------------------------------------------------
-
-      final dateKeys = <String>{
-        _formatDateKey(windowStart),
-        _formatDateKey(now),
-      };
-
-      final List<WaterHistoryRecord> records = [];
-
-      for (final dateKey in dateKeys) {
-        final dayRecords = await _loadWaterHistoryForDate(
-          uid: uid,
-          dateKey: dateKey,
-        );
-
-        records.addAll(dayRecords);
+        if (!now.isBefore(start) && !now.isAfter(finish)) {
+          windowStartHour = hour;
+        }
       }
 
-      if (records.length < 2) {
-        debugPrint('OVER DRINK: history ยังไม่พอสำหรับคำนวณ');
+      if (windowStartHour == null) {
+        return;
+      }
 
+      final windowStart = DateTime(
+        now.year,
+        now.month,
+        now.day,
+        windowStartHour,
+      );
+      final windowEnd = windowStart.add(const Duration(hours: 2));
+
+      if (now.isAfter(windowEnd)) {
+        return;
+      }
+
+      // ถ้าเพิ่งเชื่อมขวดกลางรอบ ให้เริ่มนับจากเวลาที่เชื่อม
+      _todayConnectionStart ??= await _loadTodayConnectionStart();
+      DateTime effectiveStart = windowStart;
+      if (_todayConnectionStart != null &&
+          _todayConnectionStart!.isAfter(effectiveStart)) {
+        effectiveStart = _todayConnectionStart!;
+      }
+
+      final todayKey = _formatDateKey(now);
+      final records = await _loadWaterHistoryForDate(
+        uid: uid,
+        dateKey: todayKey,
+      );
+
+      if (records.length < 2) {
         return;
       }
 
       records.sort((a, b) => a.time.compareTo(b.time));
 
-      // --------------------------------------------------------
-      // ตัดข้อมูลอนาคตออก
-      // --------------------------------------------------------
-
-      final usableRecords = records.where((record) {
-        return !record.time.isAfter(now);
-      }).toList();
-
-      if (usableRecords.length < 2) {
+      // เก็บข้อมูลตั้งแต่ก่อนจุดเริ่มเล็กน้อย 1 record
+      // เพื่อใช้เป็น baseline เทียบการลดของระดับน้ำ
+      final usable = records.where((r) => !r.time.isAfter(now)).toList();
+      if (usable.length < 2) {
         return;
       }
 
+      int firstIndex = 0;
+      for (int i = 0; i < usable.length; i++) {
+        if (!usable[i].time.isBefore(effectiveStart)) {
+          firstIndex = i > 0 ? i - 1 : i;
+          break;
+        }
+      }
+
       int totalDrankMl = 0;
+      for (int i = firstIndex + 1; i < usable.length; i++) {
+        final previous = usable[i - 1];
+        final current = usable[i];
 
-      // --------------------------------------------------------
-      // current ต้องอยู่ในช่วง 2 ชั่วโมง
-      //
-      // previous สามารถอยู่ก่อน windowStart ได้เล็กน้อย
-      // เพื่อใช้เทียบกับค่าตัวแรกในช่วง
-      // --------------------------------------------------------
-
-      for (int i = 1; i < usableRecords.length; i++) {
-        final previous = usableRecords[i - 1];
-
-        final current = usableRecords[i];
-
-        // จุดปัจจุบันอยู่นอกช่วง 2 ชั่วโมง
-        if (current.time.isBefore(windowStart)) {
+        if (current.time.isBefore(effectiveStart)) {
           continue;
         }
-
         if (current.time.isAfter(now)) {
           continue;
         }
 
         final difference = previous.volumeMl - current.volumeMl;
 
-        // ------------------------------------------------------
-        // น้ำลด = ดื่ม
-        // ------------------------------------------------------
-
+        // น้ำลด = ดื่ม / น้ำเพิ่ม = เติมน้ำ ไม่นับ
         if (difference > 0) {
           totalDrankMl += difference;
-
-          debugPrint(
-            'OVER DRINK: '
-            '${previous.volumeMl} -> '
-            '${current.volumeMl} '
-            '= drank $difference ml',
-          );
-        }
-
-        // ------------------------------------------------------
-        // น้ำเพิ่ม = เติมน้ำ
-        // ไม่นับ
-        // ------------------------------------------------------
-
-        if (difference < 0) {
-          debugPrint(
-            'OVER DRINK: REFILL '
-            '${previous.volumeMl} -> '
-            '${current.volumeMl} '
-            '= +${difference.abs()} ml '
-            '(ไม่นับ)',
-          );
         }
       }
 
-      debugPrint('');
-      debugPrint('================================');
-      debugPrint('CHECK OVER DRINK');
-      debugPrint('Window start: $windowStart');
-      debugPrint('Now: $now');
-      debugPrint('Total drank in 2 hours: $totalDrankMl ml');
-      debugPrint('Limit: > $overDrinkLimitMl ml');
-      debugPrint('================================');
+      final elapsedMinutes =
+          now.difference(windowStart).inSeconds / 60.0;
 
-      // ========================================================
-      // ต้อง "มากกว่า" 150 เท่านั้น
-      //
-      // 150 = ไม่เตือน
-      // 151 ขึ้นไป = เตือน
-      // ========================================================
+      // เป้าหมายสะสมแบบสัดส่วนเดียวกับ ESP32
+      // 30 นาที = 25%, 60 = 50%, 90 = 75%, 120 = 100%
+      final clampedMinutes = elapsedMinutes.clamp(0.0, 120.0);
+      final expectedMl = drinkAmountMl * (clampedMinutes / 120.0);
 
-      if (totalDrankMl <= overDrinkLimitMl) {
+      final lowerBound = expectedMl - drinkToleranceMl;
+      final upperBound = expectedMl + drinkToleranceMl;
+
+      String? status;
+
+      if (totalDrankMl > upperBound) {
+        status = 'over';
+      } else if (totalDrankMl >= lowerBound &&
+          totalDrankMl <= upperBound) {
+        // สีเขียวแจ้งทันทีเมื่อถึงเป้าหมายสะสมของช่วงเวลาปัจจุบัน
+        status = 'good';
+      } else {
+        // สีส้มแจ้งเฉพาะ checkpoint 30/60/90/120 นาที
+        final minuteInWindow = now.difference(windowStart).inMinutes;
+        final isCheckpoint =
+            minuteInWindow == 30 ||
+            minuteInWindow == 60 ||
+            minuteInWindow == 90 ||
+            minuteInWindow == 120;
+
+        if (isCheckpoint) {
+          status = 'low';
+        }
+      }
+
+      if (status == null) {
         return;
       }
 
-      // ========================================================
-      // เช็กว่าเพิ่งแจ้งไปหรือยัง
-      // ========================================================
+      final windowKey =
+          '$todayKey-${windowStartHour.toString().padLeft(2, '0')}';
 
-      final stateRef = getRealtimeDatabase().ref(
-        'users/$uid/notification_state/overdrink_2h',
+      // ไม่สร้างสถานะเดิมซ้ำในรอบเดียวกัน
+      if (_lastHydrationWindowKey == windowKey &&
+          _lastHydrationStatus == status) {
+        return;
+      }
+
+      await _createHydrationStatusNotification(
+        uid: uid,
+        now: now,
+        status: status,
+        totalDrankMl: totalDrankMl,
+        expectedMl: expectedMl.round(),
+        windowKey: windowKey,
       );
 
-      final stateSnapshot = await stateRef.get();
-
-      int lastAlertTimestamp = 0;
-
-      if (stateSnapshot.value is Map) {
-        final stateData = Map<Object?, Object?>.from(
-          stateSnapshot.value as Map,
-        );
-
-        lastAlertTimestamp = _parseInt(stateData['last_alert_timestamp']);
-      }
-
-      // ========================================================
-      // ถ้าเพิ่งแจ้งไปไม่ถึง 2 ชั่วโมง
-      // ไม่แจ้งซ้ำ
-      // ========================================================
-
-      if (lastAlertTimestamp > 0) {
-        final lastAlertTime = DateTime.fromMillisecondsSinceEpoch(
-          lastAlertTimestamp,
-        );
-
-        final nextAllowedTime = lastAlertTime.add(overDrinkCooldown);
-
-        if (now.isBefore(nextAllowedTime)) {
-          debugPrint(
-            'OVER DRINK: แจ้งไปแล้ว '
-            'รอถึง $nextAllowedTime',
-          );
-
-          return;
-        }
-      }
-
-      // ========================================================
-      // สร้างแจ้งเตือน
-      // ========================================================
-
-      await _createOverDrinkNotification(uid: uid, now: now);
-
-      // ========================================================
-      // บันทึกเวลาที่แจ้งล่าสุด
-      // ========================================================
-
-      await stateRef.set({
-        'last_alert_timestamp': now.millisecondsSinceEpoch,
-        'updated_at': ServerValue.timestamp,
-      });
+      _lastHydrationWindowKey = windowKey;
+      _lastHydrationStatus = status;
     } catch (e, stack) {
-      debugPrint('_checkOverDrinkAlert error: $e');
-
+      debugPrint('_checkHydrationStatus error: $e');
       debugPrint('$stack');
     } finally {
-      _isCheckingOverDrink = false;
+      _isCheckingHydrationStatus = false;
     }
+  }
+
+  Future<void> _createHydrationStatusNotification({
+    required String uid,
+    required DateTime now,
+    required String status,
+    required int totalDrankMl,
+    required int expectedMl,
+    required String windowKey,
+  }) async {
+    String type;
+    String title;
+    String message;
+
+    switch (status) {
+      case 'low':
+        type = 'drink_low';
+        title = 'ดื่มน้ำน้อยกว่าที่กำหนด';
+        message =
+            'ดื่มแล้ว $totalDrankMl mL จากเป้าหมายช่วงนี้ประมาณ $expectedMl mL';
+        break;
+      case 'good':
+        type = 'drink_good';
+        title = 'ดื่มน้ำครบตามเป้าหมาย';
+        message =
+            'ดื่มแล้ว $totalDrankMl mL อยู่ในช่วงเป้าหมายประมาณ $expectedMl mL';
+        break;
+      default:
+        type = 'drink_over';
+        title = 'ดื่มน้ำมากกว่าที่กำหนด';
+        message =
+            'ดื่มแล้ว $totalDrankMl mL มากกว่าเป้าหมายช่วงนี้ประมาณ $expectedMl mL';
+    }
+
+    final todayKey = _formatDateKey(now);
+    final timestamp = now.millisecondsSinceEpoch;
+    final alertKey = '$type-$windowKey-$timestamp';
+
+    final ref = getRealtimeDatabase().ref(
+      'users/$uid/notifications/$todayKey/$alertKey',
+    );
+
+    await ref.set({
+      'type': type,
+      'title': title,
+      'message': message,
+      'amount_ml': expectedMl,
+      'drank_ml': totalDrankMl,
+      'hour': now.hour,
+      'minute': now.minute,
+      'timestamp': timestamp,
+      'date': todayKey,
+      'time':
+          '${now.hour.toString().padLeft(2, '0')}:'
+          '${now.minute.toString().padLeft(2, '0')}',
+      'window_key': windowKey,
+      'created_at': ServerValue.timestamp,
+    });
+
+    await _showPhoneNotificationNow(
+      id: timestamp.remainder(2147483647),
+      title: title,
+      body: message,
+    );
   }
 
   // ============================================================
@@ -1255,49 +1270,6 @@ class _NotificationPageState extends State<NotificationPage> {
   // ============================================================
   // สร้าง Over Drink Notification
   // ============================================================
-
-  Future<void> _createOverDrinkNotification({
-    required String uid,
-    required DateTime now,
-  }) async {
-    final database = getRealtimeDatabase();
-
-    final todayKey = _formatDateKey(now);
-
-    final timestamp = now.millisecondsSinceEpoch;
-
-    // key ไม่ซ้ำกับแจ้งเตือนตามเวลา
-    final alertKey = 'overdrink-$timestamp';
-
-    final ref = database.ref('users/$uid/notifications/$todayKey/$alertKey');
-
-    await ref.set({
-      'type': 'overdrink_2h',
-      'title': 'ดื่มน้ำมากกว่าที่กำหนด',
-      'message': 'ปริมาณน้ำที่ดื่มในช่วง 2 ชั่วโมงนี้มากกว่าปริมาณที่กำหนด',
-      'hour': now.hour,
-      'minute': now.minute,
-      'timestamp': timestamp,
-      'date': todayKey,
-      'time':
-          '${now.hour.toString().padLeft(2, '0')}:'
-          '${now.minute.toString().padLeft(2, '0')}',
-      'created_at': ServerValue.timestamp,
-    });
-
-    await _showPhoneNotificationNow(
-      id: timestamp.remainder(2147483647),
-      title: 'ดื่มน้ำมากกว่าที่กำหนด',
-      body: 'ปริมาณน้ำที่ดื่มในช่วง 2 ชั่วโมงนี้มากกว่าปริมาณที่กำหนด',
-    );
-
-    debugPrint('');
-    debugPrint('================================');
-    debugPrint('OVER DRINK ALERT CREATED');
-    debugPrint('Date: $todayKey');
-    debugPrint('Time: ${now.hour}:${now.minute}');
-    debugPrint('================================');
-  }
 
   // ============================================================
   // ฟัง notification ทั้งหมด
@@ -1648,8 +1620,8 @@ class _NotificationPageState extends State<NotificationPage> {
                                       ? 0
                                       : 14,
                                 ),
-                                child: notification.isOverDrink
-                                    ? OverDrinkNotificationCard(
+                                child: notification.isHydrationStatus
+                                    ? HydrationStatusNotificationCard(
                                         notification: notification,
                                       )
                                     : DrinkNotificationCard(
@@ -1726,7 +1698,10 @@ class DrinkNotificationData {
 
   final String message;
 
-  bool get isOverDrink => type == 'overdrink_2h';
+  bool get isOverDrink => type == 'overdrink_2h' || type == 'drink_over';
+  bool get isLowDrink => type == 'drink_low';
+  bool get isGoodDrink => type == 'drink_good';
+  bool get isHydrationStatus => isOverDrink || isLowDrink || isGoodDrink;
 
   String get formattedTime {
     final h = hour.toString().padLeft(2, '0');
@@ -1734,6 +1709,113 @@ class DrinkNotificationData {
     final m = minute.toString().padLeft(2, '0');
 
     return '$h:$m น.';
+  }
+}
+
+// ============================================================
+// CARD สถานะการดื่มน้ำ: ส้ม / เขียว / แดง
+// ============================================================
+
+class HydrationStatusNotificationCard extends StatelessWidget {
+  const HydrationStatusNotificationCard({
+    super.key,
+    required this.notification,
+  });
+
+  final DrinkNotificationData notification;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isLow = notification.isLowDrink;
+    final bool isGood = notification.isGoodDrink;
+
+    final Color accent = isLow
+        ? const Color(0xFFF57C00)
+        : isGood
+            ? const Color(0xFF2E7D32)
+            : const Color(0xFFE53935);
+
+    final Color background = isLow
+        ? const Color(0xFFFFF5E6)
+        : isGood
+            ? const Color(0xFFEAF7EC)
+            : const Color(0xFFFFF3F3);
+
+    final Color border = isLow
+        ? const Color(0xFFFFCC80)
+        : isGood
+            ? const Color(0xFFA5D6A7)
+            : const Color(0xFFFFC5C5);
+
+    final IconData icon = isLow
+        ? Icons.water_drop_outlined
+        : isGood
+            ? Icons.check_circle_outline
+            : Icons.warning_amber_rounded;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: border),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.08),
+            blurRadius: 10,
+            offset: const Offset(0, 5),
+          ),
+        ],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 58,
+            height: 58,
+            decoration: BoxDecoration(
+              color: accent.withOpacity(0.14),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(icon, size: 36, color: accent),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  notification.title,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: accent,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  notification.message,
+                  style: const TextStyle(
+                    fontSize: 14.5,
+                    height: 1.35,
+                    color: Colors.black87,
+                  ),
+                ),
+                const SizedBox(height: 7),
+                Text(
+                  notification.formattedTime,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Colors.grey.shade600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -2056,7 +2138,7 @@ class EmptyNotificationView extends StatelessWidget {
               const SizedBox(height: 8),
 
               Text(
-                'เมื่อถึงเวลาดื่มน้ำ หรือระบบตรวจพบว่าดื่มน้ำมากกว่าที่กำหนด ระบบจะแสดงรายการไว้ที่หน้านี้',
+                'เมื่อถึงเวลาดื่มน้ำ หรือระบบตรวจพบสถานะการดื่มน้ำน้อย ครบ หรือมากกว่าที่กำหนด ระบบจะแสดงรายการไว้ที่หน้านี้',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
               ),
