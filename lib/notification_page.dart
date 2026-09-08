@@ -181,7 +181,7 @@ class _NotificationPageState extends State<NotificationPage> {
         'hydrate_smart_drink_reminders',
         'Hydrate Smart',
         channelDescription:
-            'แจ้งเตือนเวลาการดื่มน้ำและการดื่มน้ำมากกว่าที่กำหนด',
+            'แจ้งเตือนเวลาการดื่มน้ำ การดื่มน้อย และการดื่มมากกว่าที่กำหนด',
         importance: Importance.high,
         priority: Priority.high,
         enableVibration: true,
@@ -1012,8 +1012,15 @@ class _NotificationPageState extends State<NotificationPage> {
       final windowKey =
           '$todayKey-${windowStartHour.toString().padLeft(2, '0')}';
 
-      // ไม่สร้างสถานะเดิมซ้ำในรอบเดียวกัน
-      if (_lastHydrationWindowKey == windowKey &&
+      // ดื่มน้อยต้องแจ้งได้ทุก checkpoint 30 นาที
+      // เช่น 09:30, 10:00, 10:30 เป็นคนละจุดตรวจ แม้สถานะจะยังเป็น low เหมือนเดิม
+      final minuteInWindow = now.difference(windowStart).inMinutes;
+      final statusKey = status == 'low'
+          ? '$windowKey-low-$minuteInWindow'
+          : '$windowKey-$status';
+
+      // ป้องกันการสร้างแจ้งเตือนซ้ำภายใน checkpoint/สถานะเดียวกัน
+      if (_lastHydrationWindowKey == statusKey &&
           _lastHydrationStatus == status) {
         return;
       }
@@ -1024,10 +1031,10 @@ class _NotificationPageState extends State<NotificationPage> {
         status: status,
         totalDrankMl: totalDrankMl,
         expectedMl: expectedMl.round(),
-        windowKey: windowKey,
+        windowKey: statusKey,
       );
 
-      _lastHydrationWindowKey = windowKey;
+      _lastHydrationWindowKey = statusKey;
       _lastHydrationStatus = status;
     } catch (e, stack) {
       debugPrint('_checkHydrationStatus error: $e');
@@ -1049,12 +1056,15 @@ class _NotificationPageState extends State<NotificationPage> {
     String title;
     String message;
 
+    final int missingMl =
+        (expectedMl - totalDrankMl).clamp(0, expectedMl).toInt();
+
     switch (status) {
       case 'low':
         type = 'drink_low';
         title = 'ดื่มน้ำน้อยกว่าที่กำหนด';
         message =
-            'ดื่มแล้ว $totalDrankMl mL จากเป้าหมายช่วงนี้ประมาณ $expectedMl mL';
+            'ดื่มแล้ว $totalDrankMl mL จากเป้าหมายที่ควรได้รับ $expectedMl mL ขาดอีก $missingMl mL';
         break;
       case 'good':
         type = 'drink_good';
@@ -1083,6 +1093,7 @@ class _NotificationPageState extends State<NotificationPage> {
       'message': message,
       'amount_ml': expectedMl,
       'drank_ml': totalDrankMl,
+      'missing_ml': missingMl,
       'hour': now.hour,
       'minute': now.minute,
       'timestamp': timestamp,
@@ -1394,6 +1405,10 @@ class _NotificationPageState extends State<NotificationPage> {
 
           final amount = _parseInt(data['amount_ml']);
 
+          final drank = _parseInt(data['drank_ml']);
+
+          final missing = _parseInt(data['missing_ml']);
+
           final timestamp = _parseInt(data['timestamp']);
 
           final type = data['type']?.toString() ?? 'drink_reminder';
@@ -1431,6 +1446,10 @@ class _NotificationPageState extends State<NotificationPage> {
               amountMl: type == 'drink_reminder'
                   ? drinkAmountMl
                   : (amount > 0 ? amount : drinkAmountMl),
+              drankMl: drank,
+              missingMl: missing > 0
+                  ? missing
+                  : ((amount - drank) > 0 ? (amount - drank) : 0),
               timestamp: timestamp,
               type: type,
               title: title,
@@ -1676,6 +1695,8 @@ class DrinkNotificationData {
     required this.hour,
     required this.minute,
     required this.amountMl,
+    required this.drankMl,
+    required this.missingMl,
     required this.timestamp,
     required this.type,
     required this.title,
@@ -1691,6 +1712,10 @@ class DrinkNotificationData {
   final int minute;
 
   final int amountMl;
+
+  final int drankMl;
+
+  final int missingMl;
 
   final int timestamp;
 
@@ -1750,7 +1775,7 @@ class HydrationStatusNotificationCard extends StatelessWidget {
             : const Color(0xFFFFC5C5);
 
     final IconData icon = isLow
-        ? Icons.water_drop_outlined
+        ? Icons.warning_amber_rounded
         : isGood
             ? Icons.check_circle_outline
             : Icons.warning_amber_rounded;
@@ -1787,31 +1812,70 @@ class HydrationStatusNotificationCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  notification.title,
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                    color: accent,
-                  ),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        notification.title,
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: accent,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      notification.formattedTime,
+                      style: const TextStyle(
+                        fontSize: 13.5,
+                        color: Colors.black87,
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 6),
-                Text(
-                  notification.message,
-                  style: const TextStyle(
-                    fontSize: 14.5,
-                    height: 1.35,
-                    color: Colors.black87,
+
+                if (isLow) ...[
+                  const Text(
+                    'ปริมาณน้ำที่ควรดื่มต่ำกว่าเป้าหมาย\n'
+                    'ที่ควรได้รับในช่วงเวลานี้',
+                    style: TextStyle(
+                      fontSize: 14.5,
+                      height: 1.35,
+                      color: Colors.black87,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 7),
-                Text(
-                  notification.formattedTime,
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: Colors.grey.shade600,
+                  const SizedBox(height: 9),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFD99A),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Text(
+                      'ขาดอีก ${notification.missingMl} mL',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF8A4B00),
+                      ),
+                    ),
                   ),
-                ),
+                ] else ...[
+                  Text(
+                    notification.message,
+                    style: const TextStyle(
+                      fontSize: 14.5,
+                      height: 1.35,
+                      color: Colors.black87,
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
