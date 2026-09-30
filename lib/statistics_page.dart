@@ -774,7 +774,7 @@ class _StatisticsPageState extends State<StatisticsPage> {
         hasRecords: false,
       );
     }
-
+//ตั้งยอดดื่มสะสมเริ่มต้นเป็น 0 mL
     int totalDrank = 0;
 
     for (
@@ -782,22 +782,23 @@ class _StatisticsPageState extends State<StatisticsPage> {
       i < validRecords.length;
       i++
     ) {
+      //นำข้อมูลปริมาตรน้ำ ครั้งก่อน มาเก็บใน previous
       final previous =
           validRecords[i - 1];
-
+      //นำข้อมูลปริมาตรน้ำ ครั้งปัจจุบัน มาเก็บใน current
       final current =
           validRecords[i];
-
+      //หาผลต่างของน้ำที่เหลือในขวด เช่น ก่อนหน้า 500 mL ปัจจุบัน 340 mL ผลต่างคือ 160 mL
       final difference =
           previous.volumeMl -
           current.volumeMl;
-
+      //พิมพ์ค่าก่อนและหลังในหน้าต่าง Debug เช่น 500 -> 340 ml เพื่อช่วยตรวจสอบ
       debugPrint('');
       debugPrint(
         '${previous.volumeMl} -> '
         '${current.volumeMl} ml',
       );
-
+      //ตรวจว่าน้ำ ไม่ลดลง หรือไม่ หากค่าเป็น 0 แปลว่าเท่าเดิม; หากติดลบ แปลว่าน้ำเพิ่ม
       if (difference <= 0) {
         if (difference < 0) {
           debugPrint(
@@ -808,10 +809,10 @@ class _StatisticsPageState extends State<StatisticsPage> {
 
         continue;
       }
-
+      //ถ้าน้ำลดลง ให้นำปริมาณที่ลดลงมาเป็น drankAmount
       final drankAmount =
           difference;
-
+      //บวกปริมาณที่ลดลงเข้ากับยอดดื่มสะสมของวัน
       totalDrank +=
           drankAmount;
 

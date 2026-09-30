@@ -37,6 +37,9 @@ class _HomePageState extends State<HomePage> {
   // =====================================================
   int todayConsumedMl = 0;
 
+  // เก็บประวัติของวันนี้ไว้คำนวณการดื่มในช่วง 2 ชั่วโมงปัจจุบัน
+  List<_HomeWaterRecord> _todayWaterRecords = [];
+
   int lastUpdatedTimestamp = 0;
 
   bool hasBottleData = false;
@@ -254,6 +257,63 @@ class _HomePageState extends State<HomePage> {
       0,
       dailyGoalMl,
     );
+  }
+
+  // =====================================================
+  // ปริมาณที่ดื่มในช่วง 2 ชั่วโมงปัจจุบัน
+  // เช่น 11:00-13:00, 13:00-15:00, 15:00-17:00
+  // =====================================================
+  int get currentPeriodConsumedMl {
+    if (_todayWaterRecords.length < 2) return 0;
+
+    final now = DateTime.now();
+    final startHour = _currentDrinkPeriodStartHour(now);
+    final endHour = startHour + 2;
+
+    final records = _todayWaterRecords.where((record) {
+      final parts = record.key.split('-');
+      if (parts.length < 2) return false;
+      final hour = int.tryParse(parts[0]);
+      if (hour == null) return false;
+      return hour >= startHour && hour < endHour;
+    }).toList();
+
+    if (records.length < 2) return 0;
+
+    int total = 0;
+    int previous = records.first.volumeMl;
+    for (int i = 1; i < records.length; i++) {
+      final current = records[i].volumeMl;
+      if (previous > current) {
+        total += previous - current;
+      }
+      previous = current;
+    }
+    return total.clamp(0, twoHourDrinkTargetMl * 3);
+  }
+
+  int get currentPeriodRemainingMl {
+    return (twoHourDrinkTargetMl - currentPeriodConsumedMl)
+        .clamp(0, twoHourDrinkTargetMl);
+  }
+
+  double get currentPeriodProgress {
+    if (twoHourDrinkTargetMl <= 0) return 0.0;
+    return (currentPeriodConsumedMl / twoHourDrinkTargetMl)
+        .clamp(0.0, 1.0)
+        .toDouble();
+  }
+
+  int _currentDrinkPeriodStartHour(DateTime now) {
+    if (now.hour < 7) return 7;
+    if (now.hour >= 19) return 19;
+    return 7 + (((now.hour - 7) ~/ 2) * 2);
+  }
+
+  String get currentDrinkPeriodText {
+    final start = _currentDrinkPeriodStartHour(DateTime.now());
+    final end = start + 2;
+    return '${start.toString().padLeft(2, '0')}:00 - ${end.toString().padLeft(2, '0')}:00 น.';
   }
 
   // =====================================================
@@ -591,6 +651,10 @@ class _HomePageState extends State<HomePage> {
 
         if (!wasConnected || bottleSubscription == null) {
           listenBottleData();
+          unawaited(HydrationNotificationSync.syncToday(
+            uid: user.uid,
+            fallbackTargetMl: twoHourDrinkTargetMl,
+          ));
         }
       },
       onError: (error) {
@@ -987,6 +1051,12 @@ class _HomePageState extends State<HomePage> {
           _updateTodayDrinkData(
             snapshot.value,
           );
+          if (isBottleConnected) {
+            unawaited(HydrationNotificationSync.syncToday(
+              uid: uid,
+              fallbackTargetMl: twoHourDrinkTargetMl,
+            ));
+          }
         } else {
           _resetTodayDrinkData();
         }
@@ -1025,6 +1095,12 @@ class _HomePageState extends State<HomePage> {
           _updateTodayDrinkData(
             value,
           );
+          if (isBottleConnected) {
+            unawaited(HydrationNotificationSync.syncToday(
+              uid: uid,
+              fallbackTargetMl: twoHourDrinkTargetMl,
+            ));
+          }
         },
         onError: (Object error) {
           debugPrint(
@@ -1056,6 +1132,7 @@ class _HomePageState extends State<HomePage> {
 
     setState(() {
       todayConsumedMl = 0;
+      _todayWaterRecords = [];
 
       // ให้ UI แสดง 0 ML ได้
       // แทนที่จะขึ้น -- ML
@@ -1296,6 +1373,7 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       todayConsumedMl =
           totalConsumed;
+      _todayWaterRecords = List<_HomeWaterRecord>.from(records);
 
       hasHistoryVolumeData =
           true;
@@ -1956,6 +2034,22 @@ class _HomePageState extends State<HomePage> {
                                 ),
                               ),
                             ],
+                          ),
+
+                          SizedBox(
+                            height: 14 * scale,
+                          ),
+
+                          // =============================
+                          // CURRENT 2-HOUR DRINK PROGRESS
+                          // =============================
+                          CurrentPeriodDrinkCard(
+                            consumedMl: currentPeriodConsumedMl,
+                            targetMl: twoHourDrinkTargetMl,
+                            remainingMl: currentPeriodRemainingMl,
+                            progress: currentPeriodProgress,
+                            periodText: currentDrinkPeriodText,
+                            scale: scale,
                           ),
 
                           SizedBox(
@@ -3108,6 +3202,144 @@ class GoalStepButton extends StatelessWidget {
             0xFF2378C9,
           ),
         ),
+      ),
+    );
+  }
+}
+
+// =====================================================
+// การ์ดปริมาณน้ำที่ดื่มในช่วง 2 ชั่วโมงปัจจุบัน
+// =====================================================
+class CurrentPeriodDrinkCard extends StatelessWidget {
+  const CurrentPeriodDrinkCard({
+    super.key,
+    required this.consumedMl,
+    required this.targetMl,
+    required this.remainingMl,
+    required this.progress,
+    required this.periodText,
+    required this.scale,
+  });
+
+  final int consumedMl;
+  final int targetMl;
+  final int remainingMl;
+  final double progress;
+  final String periodText;
+  final double scale;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool completed = targetMl > 0 && consumedMl >= targetMl;
+
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.fromLTRB(18 * scale, 16 * scale, 18 * scale, 16 * scale),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(22 * scale),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.10),
+            blurRadius: 14,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 38 * scale,
+                height: 38 * scale,
+                decoration: const BoxDecoration(
+                  color: Color(0xFFD8ECFF),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.water_drop,
+                  color: const Color(0xFF2378C9),
+                  size: 22 * scale,
+                ),
+              ),
+              SizedBox(width: 10 * scale),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'ปริมาณน้ำที่ดื่มในช่วงนี้',
+                      style: TextStyle(
+                        fontSize: 17 * scale,
+                        fontWeight: FontWeight.bold,
+                        color: const Color(0xFF25364A),
+                      ),
+                    ),
+                    Text(
+                      periodText,
+                      style: TextStyle(
+                        fontSize: 12 * scale,
+                        color: const Color(0xFF7B8794),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 14 * scale),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                '${formatNumber(consumedMl)} ml',
+                style: TextStyle(
+                  fontSize: 24 * scale,
+                  fontWeight: FontWeight.bold,
+                  color: const Color(0xFF2378C9),
+                ),
+              ),
+              Padding(
+                padding: EdgeInsets.only(bottom: 3 * scale),
+                child: Text(
+                  ' / ${formatNumber(targetMl)} ml',
+                  style: TextStyle(
+                    fontSize: 14 * scale,
+                    fontWeight: FontWeight.w600,
+                    color: const Color(0xFF7B8794),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 10 * scale),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 10 * scale,
+              backgroundColor: const Color(0xFFDDE5EE),
+              valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF3D9ADC)),
+            ),
+          ),
+          SizedBox(height: 9 * scale),
+          Center(
+            child: Text(
+              completed
+                  ? 'ดื่มครบตามเป้าหมายช่วงนี้แล้ว'
+                  : 'ควรดื่มอีก ${formatNumber(remainingMl)} ml',
+              style: TextStyle(
+                fontSize: 13 * scale,
+                fontWeight: FontWeight.w600,
+                color: completed
+                    ? const Color(0xFF2E9D67)
+                    : const Color(0xFF667788),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

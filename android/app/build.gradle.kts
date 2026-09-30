@@ -26,14 +26,15 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID
-        applicationId = "com.example.hydrate_"
+    applicationId = "com.example.hydrate_"
 
-        minSdk = 23
-        targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
-    }
+    minSdk = 23
+    targetSdk = flutter.targetSdkVersion
+    versionCode = flutter.versionCode
+    versionName = flutter.versionName
+
+    
+}
 
     buildTypes {
         release {

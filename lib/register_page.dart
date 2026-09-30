@@ -239,7 +239,7 @@ class _RegisterPageState extends State<RegisterPage> {
                       RegisterTextField(
                         controller: passwordController,
                         icon: Icons.lock_outline,
-                        hintText: 'อย่างน้อย 6 ตัวอักษร',
+                        hintText: '123456',
                         obscureText: true,
                         textInputAction: TextInputAction.next,
                       ),
